@@ -19,25 +19,104 @@ nanobot proved that a full-featured AI agent can fit in ~4,000 lines of Python. 
 
 ## Architecture
 
+```mermaid
+graph TB
+    subgraph Channels
+        CLI[CLI Terminal]
+        Lark[Lark / Feishu]
+    end
+
+    subgraph Bus["Message Bus"]
+        IN[Inbound Channel]
+        OUT[Outbound Channel]
+    end
+
+    subgraph Agent["Agent Loop"]
+        RUN["Run()
+        message router"]
+        WA["Worker A
+        (chat_1)"]
+        WB["Worker B
+        (chat_2)"]
+        WC["Worker C
+        (chat_3)"]
+    end
+
+    subgraph Core
+        PROV["Providers
+        12+ LLMs
+        auto-detect"]
+        TOOLS["Tools
+        10 built-in
+        + MCP bridge"]
+        MEM["Memory
+        MEMORY.md
+        HISTORY.md"]
+        SESS["Sessions
+        per-chat JSONL"]
+    end
+
+    subgraph Background
+        HB[Heartbeat]
+        CRON[Cron Scheduler]
+        SUB[Sub-agents]
+    end
+
+    CLI -->|user msg| IN
+    Lark -->|user msg| IN
+    IN --> RUN
+    RUN --> WA
+    RUN --> WB
+    RUN --> WC
+    WA & WB & WC --> PROV
+    WA & WB & WC --> TOOLS
+    WA & WB & WC --> MEM
+    WA & WB & WC --> SESS
+    WA & WB & WC -->|response| OUT
+    HB -->|tasks| IN
+    CRON -->|tasks| IN
+    SUB -->|results| IN
+    OUT --> CLI
+    OUT --> Lark
+
+    style Bus fill:#e1f5fe
+    style Agent fill:#f3e5f5
+    style Core fill:#e8f5e9
+    style Background fill:#fff3e0
 ```
-                    ┌────────────────────────────────────────────┐
-                    │              Message Bus                   │
-                    │         (chan Inbound/Outbound)             │
-                    └──────┬──────────────┬─────────────────────┘
-                           │              │
-              ┌────────────▼──┐    ┌──────▼──────────┐
-              │   Channels    │    │   Agent Loop     │
-              │  CLI / Lark   │    │  (per-session    │
-              │               │    │   goroutines)    │
-              └───────────────┘    └──────┬──────────┘
-                                          │
-                    ┌─────────────────────┼─────────────────────┐
-                    │                     │                     │
-              ┌─────▼─────┐      ┌───────▼───────┐     ┌──────▼──────┐
-              │ Providers  │      │    Tools       │     │   Memory    │
-              │ 12+ LLMs   │      │ 10+ built-in   │     │ MEMORY.md   │
-              │ auto-detect │      │ + MCP bridge   │     │ HISTORY.md  │
-              └────────────┘      └────────────────┘     └─────────────┘
+
+### Message Lifecycle
+
+Each user message goes through a ReAct (Reason → Act → Observe) loop:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as Channel
+    participant W as Session Worker
+    participant LLM as LLM Provider
+    participant T as Tools
+
+    U->>C: sends message
+    C->>W: enqueue (via bus)
+
+    Note over W: load session history<br/>build system prompt
+
+    loop ReAct Loop (max 20 iterations)
+        W->>LLM: messages + tool schemas
+        LLM-->>W: response
+
+        alt has tool calls
+            W->>U: ⚙️ [working...]
+            W->>T: execute tools
+            T-->>W: results
+            Note over W: append to context
+        else final answer
+            W->>U: send response
+        end
+    end
+
+    Note over W: save to session<br/>maybe consolidate memory
 ```
 
 ## Features
@@ -53,16 +132,40 @@ Plus any OpenAI-compatible endpoint via `base_url` override.
 
 ### Concurrent Session Processing
 
-```
-Chat A ──→ [worker goroutine A] → process → process → ...
-Chat B ──→ [worker goroutine B] → process → process → ...    ← fully parallel
-Chat C ──→ [worker goroutine C] → process → process → ...
+```mermaid
+graph LR
+    subgraph "Message Bus"
+        MSG1["msg from Chat A"]
+        MSG2["msg from Chat B"]
+        MSG3["msg from Chat A"]
+        MSG4["msg from Chat C"]
+    end
+
+    subgraph "Per-Session Workers"
+        direction TB
+        WA["Worker A (Chat A)"]
+        WB["Worker B (Chat B)"]
+        WC["Worker C (Chat C)"]
+    end
+
+    MSG1 --> WA
+    MSG2 --> WB
+    MSG3 -->|"queued behind msg1
+    ack: 🔄 收到"| WA
+    MSG4 --> WC
+
+    WA -.->|parallel| WB
+    WB -.->|parallel| WC
+
+    style WA fill:#c8e6c9
+    style WB fill:#c8e6c9
+    style WC fill:#c8e6c9
 ```
 
-- Different chats run in **parallel** (separate goroutines, isolated tool state)
-- Same chat processes in **FIFO order** (no lost messages)
-- If a new message arrives while busy: immediate ack → "收到，处理完当前任务后马上处理你的"
-- `/stop` cancels the current task immediately (queued messages still process)
+- **Different chats** → fully parallel (separate goroutines, isolated tool state)
+- **Same chat** → FIFO queue (no lost messages, no conflicts)
+- **New message while busy** → immediate ack: "🔄 收到，处理完当前任务后马上处理你的"
+- **`/stop`** → cancels the current task (queued messages still process)
 
 ### Tools (10 built-in + MCP)
 
@@ -105,6 +208,25 @@ The agent reads the skill file as a playbook and follows the steps. No code chan
 ### Memory System
 
 Two-tier LLM-powered memory:
+
+```mermaid
+graph LR
+    CHAT["Chat Messages"] -->|"accumulate"| SESS["Session
+    (JSONL)"]
+    SESS -->|"exceeds memory_window"| CONS["LLM
+    Consolidation"]
+    CONS -->|"facts & patterns"| MEM["MEMORY.md
+    long-term knowledge"]
+    CONS -->|"event summary"| HIST["HISTORY.md
+    chronological log"]
+    MEM -->|"loaded into
+    system prompt"| LLM["Next LLM Call"]
+    STOP["/new command"] -->|"force consolidate"| CONS
+
+    style MEM fill:#e8f5e9
+    style HIST fill:#e3f2fd
+    style CONS fill:#fff3e0
+```
 
 - **MEMORY.md** — Long-term facts (team patterns, architecture decisions, recurring issues)
 - **HISTORY.md** — Chronological event log (searchable via grep)
