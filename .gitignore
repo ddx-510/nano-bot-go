@@ -12,6 +12,7 @@ workspace/
 .DS_Store
 Thumbs.db
 
+.claude/
 # IDE
 .idea/
 .vscode/
