@@ -1,4 +1,4 @@
-# monet-bot
+# Nano-bot-go (ALias Monet-bot)
 
 A lightweight, concurrent team agent built in Go. Inspired by [nanobot](https://github.com/HKUDS/nanobot).
 
