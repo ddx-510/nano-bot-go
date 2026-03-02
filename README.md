@@ -2,7 +2,7 @@
 
 A lightweight, concurrent team agent built in Go. Inspired by [nanobot](https://github.com/HKUDS/nanobot).
 
-Built for the [CCMonet](https://ccmonet.dev) team — an AI-powered accounting platform. monet-bot is the team member that never sleeps: investigating bugs, running standups, monitoring services, and answering questions about the codebase.
+Built for the [CCMonet](https://ccmonet.ai) team — an AI-powered accounting platform. monet-bot is the team member that never sleeps: investigating bugs, running standups, monitoring services, and answering questions about the codebase.
 
 ## Why
 
@@ -350,7 +350,7 @@ monet-bot/
 ## Credits
 
 - Inspired by [nanobot](https://github.com/HKUDS/nanobot) — the ultra-lightweight Python AI assistant framework from HKUDS
-- Built for [CCMonet](https://ccmonet.dev) — AI-powered accounting for modern finance teams
+- Built for [CCMonet](https://ccmonet.ai) — AI-powered accounting for modern finance teams
 
 ## License
 
