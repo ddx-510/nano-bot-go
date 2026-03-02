@@ -1,0 +1,20 @@
+# Binary
+monet-bot
+
+# Config (contains API keys)
+config.json
+
+# Workspace — everything is project-specific or runtime-generated.
+# The framework ships workspace.example/ as a template.
+workspace/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

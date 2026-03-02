@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(jq:*)",
+      "Bash(head:*)",
+      "Bash(find:*)",
+      "Bash(git:*)",
+      "Bash(poetry run:*)",
+      "Bash(go mod:*)",
+      "Bash(go build:*)",
+      "Bash(go build -o monet-bot . 2>&1 && ./monet-bot version 2>&1)",
+      "Bash(go get:*)",
+      "Bash(go run:*)",
+      "Bash(ls:*)",
+      "WebSearch",
+      "WebFetch(domain:open.larksuite.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/HKUDS/nanobot/main/nanobot/agent/memory.py\")",
+      "Bash(gh api:*)",
+      "Bash(curl:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(go vet:*)",
+      "WebFetch(domain:api.github.com)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "autocheck"
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "mode": "local",
+  "workspace": "./workspace",
+  "llm": {
+    "provider": "",
+    "model": "gemini-2.5-flash",
+    "api_key": "your-api-key-here",
+    "max_tokens": 8192,
+    "temperature": 0.3
+  },
+  "repos": [
+    {
+      "name": "my-repo",
+      "path": "repos/my-repo",
+      "remote": "https://github.com/org/my-repo.git",
+      "branch": "main"
+    }
+  ],
+  "services": [
+    {
+      "name": "my-api",
+      "base_url": "https://api.example.com",
+      "health_path": "/health",
+      "token": ""
+    }
+  ],
+  "channels": [
+    {
+      "type": "lark",
+      "enabled": false,
+      "app_id": "",
+      "app_secret": "",
+      "allow_from": []
+    }
+  ],
+  "heartbeat": {
+    "enabled": false,
+    "interval_minutes": 30
+  },
+  "max_iterations": 20,
+  "memory_window": 50,
+  "brave_api_key": ""
+}
