@@ -24,6 +24,7 @@ graph TB
     subgraph Channels
         CLI[CLI Terminal]
         Lark[Lark / Feishu]
+        DASH[Web Dashboard]
     end
 
     subgraph Bus["Message Bus"]
@@ -56,6 +57,11 @@ graph TB
         per-chat JSONL"]
     end
 
+    subgraph Hooks["Event System"]
+        EMIT["Emitter"]
+        HOOK["Hook Handlers"]
+    end
+
     subgraph Background
         HB[Heartbeat]
         CRON[Cron Scheduler]
@@ -64,6 +70,7 @@ graph TB
 
     CLI -->|user msg| IN
     Lark -->|user msg| IN
+    DASH -->|user msg| IN
     IN --> RUN
     RUN --> WA
     RUN --> WB
@@ -73,21 +80,26 @@ graph TB
     WA & WB & WC --> MEM
     WA & WB & WC --> SESS
     WA & WB & WC -->|response| OUT
+    WA & WB & WC -->|lifecycle events| EMIT
+    EMIT --> HOOK
+    HOOK --> DASH
     HB -->|tasks| IN
     CRON -->|tasks| IN
     SUB -->|results| IN
     OUT --> CLI
     OUT --> Lark
+    OUT --> DASH
 
     style Bus fill:#e1f5fe
     style Agent fill:#f3e5f5
     style Core fill:#e8f5e9
+    style Hooks fill:#fce4ec
     style Background fill:#fff3e0
 ```
 
 ### Message Lifecycle
 
-Each user message goes through a ReAct (Reason → Act → Observe) loop:
+Each user message goes through a ReAct (Reason + Act + Observe) loop:
 
 ```mermaid
 sequenceDiagram
@@ -96,30 +108,89 @@ sequenceDiagram
     participant W as Session Worker
     participant LLM as LLM Provider
     participant T as Tools
+    participant E as Event Emitter
 
     U->>C: sends message
     C->>W: enqueue (via bus)
+    E->>E: message.received
 
     Note over W: load session history<br/>build system prompt
 
+    E->>E: session.started
+
     loop ReAct Loop (max 20 iterations)
         W->>LLM: messages + tool schemas
+        E->>E: llm.request
         LLM-->>W: response
+        E->>E: llm.response
 
         alt has tool calls
-            W->>U: ⚙️ [working...]
+            W->>U: working...
+            E->>E: tool.start
             W->>T: execute tools
             T-->>W: results
+            E->>E: tool.end
             Note over W: append to context
         else final answer
             W->>U: send response
+            E->>E: message.sent
         end
     end
 
+    E->>E: session.completed
     Note over W: save to session<br/>maybe consolidate memory
 ```
 
 ## Features
+
+### Hook / Event System
+
+A lightweight publish-subscribe system that emits lifecycle events throughout the agent loop. Hooks receive real-time notifications for 13 event types:
+
+| Event | Emitted When |
+|-------|-------------|
+| `message.received` | User message arrives |
+| `message.sent` | Bot sends a response |
+| `session.started` | Processing begins |
+| `session.completed` | Processing finishes |
+| `session.cancelled` | Session cancelled |
+| `llm.request` | LLM API call starts |
+| `llm.response` | LLM API call returns |
+| `tool.start` | Tool execution begins |
+| `tool.end` | Tool execution finishes |
+| `memory.updated` | Memory consolidation runs |
+| `command.executed` | Slash command processed |
+| `subagent.started` | Sub-agent spawned |
+| `subagent.completed` | Sub-agent finishes |
+
+The Emitter is nil-safe — when no hooks are registered (dashboard disabled), all emit calls are zero-cost no-ops.
+
+### Web Dashboard
+
+A built-in web UI served from a single embedded HTML file. Acts as both a **Channel** (send/receive messages) and a **Hook** (display lifecycle events).
+
+**Chat View** — Clean conversation interface with:
+- User and assistant message bubbles
+- Collapsible "thinking" blocks that group internal events (LLM calls, tool executions) into a single expandable section, similar to Claude Code's interface
+- Markdown rendering for assistant responses (code blocks, bold, italic, lists, tables, blockquotes)
+- Real-time WebSocket updates
+
+**Events View** — Raw event firehose for debugging, filterable by session.
+
+```json
+{
+  "dashboard": {
+    "enabled": true,
+    "port": 8080
+  }
+}
+```
+
+When enabled, the dashboard is accessible at `http://localhost:<port>`. Late-joining clients receive the last 200 events from a ring buffer.
+
+### Knowledge Base Integration
+
+The agent can be configured with a product knowledge base repo (e.g. PRD documents, feature specifications). When configured, the agent checks the knowledge base **first** before diving into code repos for product/feature questions. This dramatically reduces unnecessary code exploration for questions that are already documented.
 
 ### LLM Providers
 Auto-detection from API key or model name. 12+ providers supported:
@@ -150,8 +221,7 @@ graph LR
 
     MSG1 --> WA
     MSG2 --> WB
-    MSG3 -->|"queued behind msg1
-    ack: 🔄 收到"| WA
+    MSG3 -->|"queued behind msg1"| WA
     MSG4 --> WC
 
     WA -.->|parallel| WB
@@ -162,10 +232,10 @@ graph LR
     style WC fill:#c8e6c9
 ```
 
-- **Different chats** → fully parallel (separate goroutines, isolated tool state)
-- **Same chat** → FIFO queue (no lost messages, no conflicts)
-- **New message while busy** → immediate ack: "🔄 收到，处理完当前任务后马上处理你的"
-- **`/stop`** → cancels the current task (queued messages still process)
+- **Different chats** -> fully parallel (separate goroutines, isolated tool state)
+- **Same chat** -> FIFO queue (no lost messages, no conflicts)
+- **New message while busy** -> immediate ack
+- **`/stop`** -> cancels the current task (queued messages still process)
 
 ### Tools (10 built-in + MCP)
 
@@ -207,7 +277,7 @@ The agent reads the skill file as a playbook and follows the steps. No code chan
 
 ### Memory System
 
-Two-tier LLM-powered memory:
+Two-tier LLM-powered memory with per-chat context:
 
 ```mermaid
 graph LR
@@ -217,21 +287,27 @@ graph LR
     Consolidation"]
     CONS -->|"facts & patterns"| MEM["MEMORY.md
     long-term knowledge"]
+    CONS -->|"chat context"| CMEM["chat_*.md
+    per-chat memory"]
     CONS -->|"event summary"| HIST["HISTORY.md
     chronological log"]
     MEM -->|"loaded into
     system prompt"| LLM["Next LLM Call"]
+    CMEM -->|"loaded for
+    matching chat"| LLM
     STOP["/new command"] -->|"force consolidate"| CONS
 
     style MEM fill:#e8f5e9
+    style CMEM fill:#e8f5e9
     style HIST fill:#e3f2fd
     style CONS fill:#fff3e0
 ```
 
 - **MEMORY.md** — Long-term facts (team patterns, architecture decisions, recurring issues)
+- **chat_*.md** — Per-chat memory (ongoing investigations, project context, decisions in progress)
 - **HISTORY.md** — Chronological event log (searchable via grep)
 
-Auto-consolidation triggers when unconsolidated messages exceed `memory_window`. The LLM extracts knowledge from old messages and merges it into MEMORY.md. Manual trigger via `/new`.
+Auto-consolidation triggers when unconsolidated messages exceed `memory_window`. The LLM extracts knowledge from old messages and merges it into MEMORY.md. Manual trigger via `/new`. Memory auto-compresses when it exceeds `max_memory_bytes`.
 
 ### Team Identity Map
 
@@ -242,7 +318,7 @@ Auto-consolidation triggers when unconsolidated messages exceed `memory_window`.
   - git aliases: ddx-510
 ```
 
-Auto-learned from Lark @mentions. The agent uses this to attribute code ownership (`git blame` → person → Lark @mention).
+Auto-learned from Lark @mentions. The agent uses this to attribute code ownership (`git blame` -> person -> Lark @mention).
 
 ### Heartbeat (LLM-powered)
 
@@ -263,6 +339,7 @@ The agent reads HEARTBEAT.md, evaluates the checklist (health endpoints, git log
 
 - **CLI** — Interactive terminal for local development
 - **Lark (Feishu)** — Enterprise messaging with @mention support, rich text parsing, image attachments
+- **Web Dashboard** — Built-in browser UI with chat and event monitoring
 
 ## Quick Start
 
@@ -370,6 +447,22 @@ Services are available via the `query_api` tool. If `mcp_url` or `mcp_cmd` is se
 
 `allow_from` restricts which Lark group chats the bot responds to. Empty = respond to all.
 
+### Dashboard
+
+```json
+{
+  "dashboard": {
+    "enabled": true,
+    "port": 8080
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | false | Enable the web dashboard |
+| `port` | int | 8080 | HTTP server port |
+
 ### Cron Jobs
 
 ```json
@@ -392,6 +485,7 @@ Cron expressions follow standard 5-field format. The `task` is injected as a use
 |-------|------|---------|-------------|
 | `max_iterations` | int | 20 | Max ReAct loop iterations per message |
 | `memory_window` | int | 50 | Messages before auto-consolidation |
+| `max_memory_bytes` | int | 4096 | Max MEMORY.md size before auto-compression |
 | `brave_api_key` | string | — | Brave Search API key |
 | `send_progress` | bool | true | Send "working..." progress messages |
 | `send_tool_hints` | bool | false | Show detailed tool call descriptions |
@@ -405,6 +499,8 @@ Cron expressions follow standard 5-field format. The `task` is injected as a use
 | `/new` | Save memory & clear session |
 | `/memory` | Show current team memory |
 | `/skills` | List available skills |
+| `/continue` | Respond to all messages (no @mention needed) |
+| `/atmode` | Only respond when @mentioned (default) |
 
 ## Workspace Structure
 
@@ -415,15 +511,18 @@ workspace/
 ├── TEAM.md              # Team identity map (auto-updated)
 ├── HEARTBEAT.md         # Periodic health check tasks
 ├── skills/
-│   ├── standup.md       # Daily standup skill
-│   └── investigate-bug.md
+│   ├── cc-refine-prd/   # PRD refinement skill
+│   ├── cc-review-prd/   # PRD review skill
+│   └── ...              # More skills
 ├── repos/
 │   ├── ccmonet-go/      # Cloned repos (read-only)
 │   ├── ccmonet-web/
+│   ├── ccmonet-prd/     # Product knowledge base
 │   └── curiosity/
 ├── memory/
 │   ├── MEMORY.md        # Long-term team memory
-│   └── HISTORY.md       # Chronological event log
+│   ├── HISTORY.md       # Chronological event log
+│   └── chat_*.md        # Per-chat memory files
 └── sessions/
     └── lark_xxx.jsonl   # Per-chat session history
 ```
@@ -455,6 +554,13 @@ monet-bot/
 │   ├── spawn.go         # Sub-agent spawning
 │   ├── cron.go          # Dynamic cron management
 │   └── mcp.go           # MCP client (stdio + HTTP)
+├── hooks/
+│   └── hooks.go         # Event types, Hook interface, Emitter
+├── dashboard/
+│   ├── dashboard.go     # HTTP server, WebSocket, Channel + Hook
+│   ├── hub.go           # WebSocket connection hub
+│   └── static/
+│       └── index.html   # Embedded SPA (chat + events UI)
 ├── channels/
 │   ├── channel.go       # Channel interface
 │   ├── cli.go           # Terminal channel
@@ -467,7 +573,7 @@ monet-bot/
     └── manager.go       # Git repo cloning and auto-pull
 ```
 
-~5,000 lines of Go. Single binary. No runtime dependencies.
+~5,500 lines of Go. Single binary. No runtime dependencies.
 
 ## Credits
 

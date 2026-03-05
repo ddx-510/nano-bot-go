@@ -68,10 +68,18 @@ func BuildSystemPrompt(workspace string, memory *Memory, skills []Skill, channel
 		parts = append(parts, "## Repo Structure\nThese are the ACTUAL top-level directories in each repo. Only use paths that exist here.\n"+repoTree)
 	}
 
-	// 4. Memory
+	// 4. Global Memory
 	mem := memory.LoadMemory()
 	if mem != "" {
-		parts = append(parts, fmt.Sprintf("## Team Memory\n%s", mem))
+		parts = append(parts, fmt.Sprintf("## Team Memory (Global)\n%s", mem))
+	}
+
+	// 4b. Per-chat Memory
+	if channel != "" && chatID != "" {
+		chatMem := memory.LoadChatMemory(channel, chatID)
+		if chatMem != "" {
+			parts = append(parts, fmt.Sprintf("## Chat Memory (this conversation)\n%s", chatMem))
+		}
 	}
 
 	// 5. Skills

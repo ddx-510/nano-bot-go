@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CCMonet Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+
+  /* Header */
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 10px 20px;
+    display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+  header h1 { font-size: 15px; font-weight: 600; }
+  .tabs { display: flex; gap: 2px; margin-left: 24px; }
+  .tab { padding: 6px 16px; font-size: 13px; cursor: pointer; border-radius: 6px 6px 0 0;
+    color: var(--muted); border: 1px solid transparent; border-bottom: none; transition: all 0.15s; }
+  .tab:hover { color: var(--text); background: var(--bg); }
+  .tab.active { color: var(--text); background: var(--bg); border-color: var(--border); }
+  .header-right { display: flex; gap: 16px; margin-left: auto; font-size: 12px; color: var(--muted); align-items: center; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+  .dot.on { background: var(--green); } .dot.off { background: var(--red); }
+
+  /* Views */
+  .view { flex: 1; overflow: hidden; display: none; }
+  .view.active { display: flex; }
+
+  /* ===== CHAT VIEW ===== */
+  .chat-view { flex-direction: column; }
+  .chat-messages { flex: 1; overflow-y: auto; padding: 16px 20px; }
+  .chat-msg { margin-bottom: 16px; max-width: 720px; }
+  .chat-msg.user { margin-left: auto; }
+  .chat-msg.assistant { margin-right: auto; }
+
+  .chat-bubble { padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.6;
+    word-break: break-word; }
+  .chat-bubble p { margin: 0 0 8px 0; } .chat-bubble p:last-child { margin-bottom: 0; }
+  .chat-bubble code { background: #ffffff15; padding: 1px 5px; border-radius: 3px;
+    font-family: 'SF Mono', Menlo, monospace; font-size: 13px; }
+  .chat-bubble pre { background: #0d1117; padding: 10px 12px; border-radius: 6px; margin: 8px 0;
+    overflow-x: auto; font-size: 13px; line-height: 1.4; }
+  .chat-bubble pre code { background: none; padding: 0; }
+  .chat-bubble ul, .chat-bubble ol { margin: 4px 0 8px 20px; }
+  .chat-bubble li { margin-bottom: 2px; }
+  .chat-bubble strong { font-weight: 600; }
+  .chat-bubble em { font-style: italic; }
+  .chat-bubble h1,.chat-bubble h2,.chat-bubble h3 { margin: 12px 0 6px 0; font-size: 15px; font-weight: 600; }
+  .chat-bubble blockquote { border-left: 3px solid var(--border); padding-left: 10px; margin: 6px 0;
+    color: var(--muted); }
+  .chat-bubble table { border-collapse: collapse; margin: 6px 0; font-size: 13px; }
+  .chat-bubble th, .chat-bubble td { border: 1px solid var(--border); padding: 4px 8px; }
+  .chat-bubble th { background: var(--surface); }
+  .chat-msg.user .chat-bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+  .chat-msg.assistant .chat-bubble { background: var(--surface); border: 1px solid var(--border);
+    border-bottom-left-radius: 4px; }
+  .chat-sender { font-size: 11px; color: var(--muted); margin-bottom: 3px; padding: 0 4px; }
+  .chat-msg.user .chat-sender { text-align: right; }
+  .chat-time { font-size: 10px; color: var(--muted); margin-top: 3px; padding: 0 4px; }
+  .chat-msg.user .chat-time { text-align: right; }
+
+  /* Thinking block (collapsible internal events) */
+  .thinking-block { margin-bottom: 16px; max-width: 720px; }
+  .thinking-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 6px 10px;
+    font-size: 12px; color: var(--muted); border-radius: 6px; transition: background 0.15s; }
+  .thinking-toggle:hover { background: var(--surface); }
+  .thinking-toggle .arrow { transition: transform 0.2s; font-size: 10px; }
+  .thinking-toggle .arrow.open { transform: rotate(90deg); }
+  .thinking-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+    border-top-color: var(--purple); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .thinking-steps { display: none; margin: 4px 0 0 20px; padding: 8px 12px;
+    border-left: 2px solid var(--border); font-size: 12px; color: var(--muted); }
+  .thinking-steps.open { display: block; }
+  .thinking-step { padding: 2px 0; font-family: 'SF Mono', Menlo, monospace; }
+  .thinking-step .step-icon { margin-right: 6px; }
+  .thinking-step.tool { color: var(--yellow); }
+  .thinking-step.llm { color: var(--purple); }
+  .thinking-step.subagent { color: var(--purple); }
+
+  /* Input bar (shared) */
+  .input-bar { border-top: 1px solid var(--border); padding: 12px 20px; display: flex; gap: 8px;
+    background: var(--surface); flex-shrink: 0; }
+  .input-bar input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 14px; color: var(--text); font-size: 14px; outline: none; }
+  .input-bar input:focus { border-color: var(--accent); }
+  .input-bar button { background: var(--accent); color: #fff; border: none; border-radius: 8px;
+    padding: 10px 20px; font-size: 14px; cursor: pointer; font-weight: 500; }
+  .input-bar button:hover { opacity: 0.9; }
+
+  /* ===== EVENTS VIEW ===== */
+  .events-view { flex-direction: row; }
+  .events-sidebar { width: 200px; border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+  .events-sidebar .panel-header { padding: 10px 14px; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border);
+    letter-spacing: 0.5px; flex-shrink: 0; }
+  .session-list { overflow-y: auto; flex: 1; }
+  .session-item { padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--border);
+    font-size: 12px; transition: background 0.15s; }
+  .session-item:hover { background: var(--border); }
+  .session-item.active { background: #1f6feb22; border-left: 3px solid var(--accent); }
+  .session-item .id { color: var(--accent); font-weight: 500; font-size: 11px; }
+  .session-item .status { font-size: 10px; color: var(--muted); margin-top: 2px; }
+
+  .events-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .events-scroll { flex: 1; overflow-y: auto; padding: 10px; }
+
+  .event { margin-bottom: 4px; padding: 5px 10px; border-radius: 4px; font-size: 12px;
+    border-left: 3px solid var(--border); background: var(--surface);
+    font-family: 'SF Mono', Menlo, monospace; display: flex; gap: 8px; align-items: baseline; }
+  .event .ev-time { color: var(--muted); font-size: 11px; flex-shrink: 0; width: 70px; }
+  .event .ev-type { font-weight: 600; font-size: 11px; flex-shrink: 0; width: 140px; }
+  .event .ev-data { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; flex: 1; min-width: 0; }
+
+  .event.message-received { border-left-color: var(--accent); }
+  .event.message-sent { border-left-color: var(--green); }
+  .event.llm-request, .event.llm-response { border-left-color: var(--purple); }
+  .event.tool-start, .event.tool-end { border-left-color: var(--yellow); }
+  .event.session-started, .event.session-completed { border-left-color: var(--green); }
+  .event.session-cancelled { border-left-color: var(--red); }
+  .event.subagent-started, .event.subagent-completed { border-left-color: var(--purple); }
+  .event.memory-updated { border-left-color: var(--yellow); }
+  .event.command-executed { border-left-color: var(--muted); }
+
+  .empty { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
+
+  @media (max-width: 700px) { .events-sidebar { display: none; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>CCMonet</h1>
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('chat')">Chat</div>
+    <div class="tab" onclick="switchTab('events')">Events</div>
+  </div>
+  <div class="header-right">
+    <span><span class="dot" id="ws-dot"></span><span id="ws-status">Connecting...</span></span>
+    <span id="uptime"></span>
+    <span id="event-count">0 events</span>
+  </div>
+</header>
+
+<!-- CHAT VIEW -->
+<div class="view chat-view active" id="view-chat">
+  <div class="chat-messages" id="chat-messages">
+    <div class="empty" id="chat-empty">Send a message to start chatting with the agent.</div>
+  </div>
+  <div class="input-bar">
+    <input type="text" id="chat-input" placeholder="Message the agent..." autocomplete="off">
+    <button onclick="sendMessage()">Send</button>
+  </div>
+</div>
+
+<!-- EVENTS VIEW -->
+<div class="view events-view" id="view-events">
+  <div class="events-sidebar">
+    <div class="panel-header">Sessions</div>
+    <div class="session-list" id="session-list">
+      <div class="empty">No sessions</div>
+    </div>
+  </div>
+  <div class="events-main">
+    <div class="events-scroll" id="events-scroll">
+      <div class="empty" id="events-empty">Waiting for events...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const S = {
+  sessions: {},
+  events: [],
+  chatMessages: [],   // {role, text, time, thinking[]}
+  totalEvents: 0,
+  ws: null,
+  startTime: Date.now(),
+  selectedSession: null,
+  activeTab: 'chat',
+  pendingThinking: null  // current in-progress thinking block
+};
+
+function switchTab(tab) {
+  S.activeTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.textContent.toLowerCase() === tab));
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + tab).classList.add('active');
+  if (tab === 'chat') document.getElementById('chat-input').focus();
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+  S.ws = ws;
+  ws.onopen = () => { setStatus(true); };
+  ws.onclose = () => { setStatus(false); setTimeout(connect, 2000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch(err) { console.error(err); } };
+}
+
+function setStatus(on) {
+  document.getElementById('ws-dot').className = 'dot ' + (on ? 'on' : 'off');
+  document.getElementById('ws-status').textContent = on ? 'Connected' : 'Disconnected';
+}
+
+// ── Event handling ──
+function handleEvent(ev) {
+  S.totalEvents++;
+  S.events.push(ev);
+  if (S.events.length > 1000) S.events = S.events.slice(-800);
+  document.getElementById('event-count').textContent = S.totalEvents + ' events';
+
+  // Track sessions
+  if (ev.session_id) {
+    if (!S.sessions[ev.session_id]) {
+      S.sessions[ev.session_id] = { id: ev.session_id, status: 'active', count: 0 };
+      renderSessions();
+    }
+    S.sessions[ev.session_id].count++;
+    if (ev.type === 'session.completed' || ev.type === 'session.cancelled') {
+      S.sessions[ev.session_id].status = ev.type === 'session.completed' ? 'done' : 'cancelled';
+      renderSessions();
+    }
+    if (ev.type === 'session.started') {
+      S.sessions[ev.session_id].status = 'active';
+      renderSessions();
+    }
+  }
+
+  // Chat view updates
+  handleChatEvent(ev);
+
+  // Events view updates
+  if (!S.selectedSession || ev.session_id === S.selectedSession) {
+    appendRawEvent(ev);
+  }
+}
+
+// ── Chat view logic ──
+const INTERNAL_EVENTS = new Set([
+  'session.started',
+  'llm.request', 'llm.response', 'tool.start', 'tool.end',
+  'subagent.started', 'subagent.completed', 'memory.updated'
+]);
+
+function handleChatEvent(ev) {
+  // User message
+  if (ev.type === 'message.received' && ev.data) {
+    finishThinking();
+    addChatMessage('user', ev.data.text || '', ev.timestamp, ev.data.user);
+    return;
+  }
+
+  // Bot response — deduplicate: message.sent (hook) and outbound_message (channel) carry the same text.
+  // Prefer message.sent; ignore outbound_message to avoid showing the message twice.
+  if (ev.type === 'message.sent' && ev.data) {
+    finishThinking();
+    addChatMessage('assistant', ev.data.text || '', ev.timestamp);
+    return;
+  }
+  if (ev.type === 'outbound_message') {
+    // Already handled via message.sent hook — skip to prevent duplicate.
+    return;
+  }
+
+  // Session end events → finish thinking, don't add as step
+  if (ev.type === 'session.completed' || ev.type === 'session.cancelled') {
+    finishThinking();
+    return;
+  }
+
+  // Commands are instant — no thinking block needed
+  if (ev.type === 'command.executed') {
+    return;
+  }
+
+  // Internal events → thinking block
+  if (INTERNAL_EVENTS.has(ev.type)) {
+    addThinkingStep(ev);
+  }
+}
+
+function addChatMessage(role, text, timestamp, user) {
+  // Skip progress messages
+  if (role === 'assistant' && /^\u2699/.test(text)) return;
+  // Skip queued ack
+  if (role === 'assistant' && /^\U0001f504/.test(text)) return;
+
+  const container = document.getElementById('chat-messages');
+  const empty = document.getElementById('chat-empty');
+  if (empty) empty.remove();
+
+  const el = document.createElement('div');
+  el.className = `chat-msg ${role}`;
+
+  const time = timestamp ? new Date(timestamp).toLocaleTimeString() : '';
+  const sender = role === 'user' ? (user || 'You') : 'CCMonet';
+
+  const rendered = role === 'assistant' ? md(text) : esc(text);
+  el.innerHTML = `
+    <div class="chat-sender">${esc(sender)}</div>
+    <div class="chat-bubble">${rendered}</div>
+    <div class="chat-time">${time}</div>
+  `;
+  container.appendChild(el);
+  container.scrollTop = container.scrollHeight;
+}
+
+function addThinkingStep(ev) {
+  const container = document.getElementById('chat-messages');
+  const empty = document.getElementById('chat-empty');
+  if (empty) empty.remove();
+
+  if (!S.pendingThinking) {
+    // Create new thinking block
+    const block = document.createElement('div');
+    block.className = 'thinking-block';
+    const id = 'think-' + Date.now();
+    block.innerHTML = `
+      <div class="thinking-toggle" onclick="toggleThinking('${id}')">
+        <span class="thinking-spinner" id="${id}-spinner"></span>
+        <span class="arrow" id="${id}-arrow">&#9654;</span>
+        <span id="${id}-label">Thinking...</span>
+      </div>
+      <div class="thinking-steps" id="${id}-steps"></div>
+    `;
+    container.appendChild(block);
+    S.pendingThinking = { id, steps: 0, el: block };
+  }
+
+  const t = S.pendingThinking;
+  const stepsEl = document.getElementById(t.id + '-steps');
+  if (!stepsEl) return;
+
+  const step = document.createElement('div');
+  const desc = describeStep(ev);
+  step.className = 'thinking-step ' + desc.cls;
+  step.innerHTML = `<span class="step-icon">${desc.icon}</span>${esc(desc.text)}`;
+  stepsEl.appendChild(step);
+  t.steps++;
+
+  // Update label
+  const label = document.getElementById(t.id + '-label');
+  if (label) label.textContent = desc.summary || `Thinking... (${t.steps} steps)`;
+
+  container.scrollTop = container.scrollHeight;
+}
+
+function finishThinking() {
+  if (!S.pendingThinking) return;
+  const t = S.pendingThinking;
+
+  // Remove spinner, update label
+  const spinner = document.getElementById(t.id + '-spinner');
+  if (spinner) spinner.style.display = 'none';
+  const label = document.getElementById(t.id + '-label');
+  if (label) label.textContent = `${t.steps} internal steps`;
+
+  S.pendingThinking = null;
+}
+
+function toggleThinking(id) {
+  const steps = document.getElementById(id + '-steps');
+  const arrow = document.getElementById(id + '-arrow');
+  if (!steps) return;
+  const open = steps.classList.toggle('open');
+  if (arrow) arrow.classList.toggle('open', open);
+}
+
+function describeStep(ev) {
+  const d = ev.data || {};
+  switch (ev.type) {
+    case 'llm.request':
+      return { icon: '>', text: `LLM request (iteration ${d.iteration || 0})`, cls: 'llm', summary: 'Calling LLM...' };
+    case 'llm.response':
+      return { icon: '<', text: `LLM response (${d.content_length || 0} chars${d.has_tool_calls ? ', has tool calls' : ''})`,
+        cls: 'llm', summary: d.has_tool_calls ? 'Using tools...' : 'Generating response...' };
+    case 'tool.start':
+      return { icon: '\u25B6', text: `${d.tool}(${d.args ? JSON.stringify(d.args).substring(0, 80) : ''})`,
+        cls: 'tool', summary: `Running ${d.tool}...` };
+    case 'tool.end':
+      return { icon: '\u2713', text: `${d.tool} done (${d.result_length || 0} chars)`, cls: 'tool' };
+    case 'subagent.started':
+      return { icon: '\u21AA', text: `subagent [${d.id}] ${d.label}`, cls: 'subagent', summary: 'Running subagent...' };
+    case 'subagent.completed':
+      return { icon: '\u2713', text: `subagent [${d.id}] ${d.status}`, cls: 'subagent' };
+    case 'session.started':
+      return { icon: '\u25CF', text: 'Session started', cls: '' };
+    case 'session.completed':
+      return { icon: '\u2713', text: 'Session completed', cls: '' };
+    case 'session.cancelled':
+      return { icon: '\u2717', text: 'Session cancelled', cls: '' };
+    case 'memory.updated':
+      return { icon: '\U0001F9E0', text: `Memory updated (${d.messages_consolidated || 0} messages)`, cls: '' };
+    case 'command.executed':
+      return { icon: '/', text: d.command || 'command', cls: '' };
+    default:
+      return { icon: '\u00B7', text: ev.type, cls: '' };
+  }
+}
+
+// ── Events view logic ──
+function appendRawEvent(ev) {
+  const container = document.getElementById('events-scroll');
+  const empty = document.getElementById('events-empty');
+  if (empty) empty.remove();
+
+  const el = document.createElement('div');
+  const cssClass = (ev.type || '').replace(/\./g, '-');
+  el.className = `event ${cssClass}`;
+
+  const time = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
+  const data = ev.data ? formatEventData(ev.type, ev.data) : '';
+
+  el.innerHTML = `<span class="ev-time">${time}</span><span class="ev-type">${ev.type || ''}</span><span class="ev-data" title="${esc(data)}">${esc(data)}</span>`;
+  container.appendChild(el);
+  container.scrollTop = container.scrollHeight;
+}
+
+function formatEventData(type, d) {
+  if (!d) return '';
+  switch(type) {
+    case 'message.received': return d.text || '';
+    case 'message.sent': return (d.text || '').substring(0, 120);
+    case 'tool.start': return `${d.tool}(${d.args ? JSON.stringify(d.args).substring(0, 80) : ''})`;
+    case 'tool.end': return `${d.tool} \u2192 ${d.result_length || 0}c`;
+    case 'llm.request': return `iter ${d.iteration || 0}`;
+    case 'llm.response': return `tools:${d.has_tool_calls} len:${d.content_length || 0}`;
+    case 'subagent.started': return `[${d.id}] ${d.label}`;
+    case 'subagent.completed': return `[${d.id}] ${d.status}`;
+    case 'session.started': return (d.text || '').substring(0, 80);
+    case 'session.completed': return '';
+    case 'memory.updated': return `${d.messages_consolidated} msgs`;
+    case 'command.executed': return d.command || '';
+    default: return JSON.stringify(d).substring(0, 120);
+  }
+}
+
+function renderSessions() {
+  const list = document.getElementById('session-list');
+  const ids = Object.keys(S.sessions);
+  if (!ids.length) { list.innerHTML = '<div class="empty">No sessions</div>'; return; }
+  list.innerHTML = ids.map(id => {
+    const s = S.sessions[id];
+    const active = id === S.selectedSession ? ' active' : '';
+    const icon = s.status === 'active' ? '\u25CF' : s.status === 'done' ? '\u2713' : '\u2717';
+    const color = s.status === 'active' ? 'var(--green)' : s.status === 'done' ? 'var(--muted)' : 'var(--red)';
+    return `<div class="session-item${active}" onclick="selectSession('${id}')">
+      <div class="id">${id}</div>
+      <div class="status" style="color:${color}">${icon} ${s.status} (${s.count})</div>
+    </div>`;
+  }).join('');
+}
+
+function selectSession(id) {
+  S.selectedSession = S.selectedSession === id ? null : id;
+  renderSessions();
+  const container = document.getElementById('events-scroll');
+  container.innerHTML = '';
+  const filtered = S.selectedSession ? S.events.filter(e => e.session_id === S.selectedSession) : S.events;
+  if (!filtered.length) { container.innerHTML = '<div class="empty">No events</div>'; return; }
+  filtered.forEach(e => appendRawEvent(e));
+}
+
+// ── Shared ──
+function sendMessage() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text || !S.ws) return;
+  S.ws.send(JSON.stringify({ action: 'send_message', chat_id: 'dashboard', text }));
+  input.value = '';
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// Lightweight markdown → HTML (no external deps)
+function md(text) {
+  if (!text) return '';
+  let s = esc(text);
+
+  // Code blocks: ```lang\n...\n```
+  s = s.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => `<pre><code>${code.trimEnd()}</code></pre>`);
+
+  // Inline code
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  // Headers
+  s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+
+  // Bold & italic
+  s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+  // Blockquote
+  s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+
+  // Unordered list
+  s = s.replace(/^- (.+)$/gm, '<li>$1</li>');
+  s = s.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+
+  // Tables
+  s = s.replace(/^(\|.+\|)\n(\|[-| :]+\|)\n((?:\|.+\|\n?)+)/gm, (_, header, sep, body) => {
+    const ths = header.split('|').filter(c => c.trim()).map(c => `<th>${c.trim()}</th>`).join('');
+    const rows = body.trim().split('\n').map(row => {
+      const tds = row.split('|').filter(c => c.trim()).map(c => `<td>${c.trim()}</td>`).join('');
+      return `<tr>${tds}</tr>`;
+    }).join('');
+    return `<table><thead><tr>${ths}</tr></thead><tbody>${rows}</tbody></table>`;
+  });
+
+  // Paragraphs (double newline)
+  s = s.replace(/\n\n+/g, '</p><p>');
+  // Single newlines → <br> (but not inside pre/table)
+  s = s.replace(/(?<!<\/pre>|<\/table>|<\/ul>|<\/blockquote>|<\/h[123]>)\n/g, '<br>');
+  s = '<p>' + s + '</p>';
+  // Clean empty paragraphs
+  s = s.replace(/<p>\s*<\/p>/g, '');
+  // Don't wrap block elements in <p>
+  s = s.replace(/<p>(<(?:pre|h[123]|ul|table|blockquote)[\s>])/g, '$1');
+  s = s.replace(/(<\/(?:pre|h[123]|ul|table|blockquote)>)<\/p>/g, '$1');
+
+  return s;
+}
+
+setInterval(() => {
+  const s = Math.floor((Date.now() - S.startTime) / 1000);
+  document.getElementById('uptime').textContent = `${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m ${s%60}s`;
+}, 1000);
+
+document.getElementById('chat-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+
+connect();
+</script>
+</body>
+</html>

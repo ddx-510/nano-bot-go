@@ -12,7 +12,9 @@ import (
 	"github.com/PlatoX-Type/monet-bot/channels"
 	"github.com/PlatoX-Type/monet-bot/config"
 	cronpkg "github.com/PlatoX-Type/monet-bot/cron"
+	"github.com/PlatoX-Type/monet-bot/dashboard"
 	"github.com/PlatoX-Type/monet-bot/heartbeat"
+	"github.com/PlatoX-Type/monet-bot/hooks"
 	"github.com/PlatoX-Type/monet-bot/providers"
 	"github.com/PlatoX-Type/monet-bot/repos"
 )
@@ -67,8 +69,24 @@ var runCmd = &cobra.Command{
 		// Create agent loop
 		loop := agent.NewLoop(cfg, provider, mb, cronSvc)
 
+		// Set up hooks/emitter and dashboard
+		var emitter *hooks.Emitter
+		if cfg.Dashboard.Enabled {
+			emitter = hooks.NewEmitter()
+		}
+		loop.Emitter = emitter
+		loop.SubagentManager.Emitter = emitter
+
 		// Set up channels
 		mgr := channels.NewManager(mb)
+
+		// Register dashboard as both Channel and Hook
+		if cfg.Dashboard.Enabled {
+			dash := dashboard.New(mb, cfg.Dashboard.Port)
+			mgr.Register(dash)
+			emitter.Register(dash)
+			log.Printf("[dashboard] enabled on port %d", cfg.Dashboard.Port)
+		}
 
 		switch channelName {
 		case "cli":

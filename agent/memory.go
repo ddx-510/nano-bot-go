@@ -38,11 +38,16 @@ var saveMemoryTool = []map[string]any{
 					},
 					"memory_update": map[string]any{
 						"type": "string",
-						"description": "Full updated long-term memory as markdown. Include all existing " +
-							"facts plus new ones. Return unchanged if nothing new.",
+						"description": "Full updated GLOBAL long-term memory as markdown. Only team-wide facts, " +
+							"conventions, and knowledge that apply across all chats. Return unchanged if nothing new.",
+					},
+					"chat_memory_update": map[string]any{
+						"type": "string",
+						"description": "Context specific to THIS chat session — ongoing investigations, project " +
+							"context, decisions in progress. Return empty string if nothing chat-specific.",
 					},
 				},
-				"required": []string{"history_entry", "memory_update"},
+				"required": []string{"history_entry", "memory_update", "chat_memory_update"},
 			},
 		},
 	},
@@ -75,6 +80,33 @@ func (m *Memory) LoadMemory() string {
 	return string(data)
 }
 
+// chatMemoryPath returns the path for a per-chat memory file.
+func (m *Memory) chatMemoryPath(channel, chatID string) string {
+	safe := strings.NewReplacer("/", "_", ":", "_").Replace(chatID)
+	return filepath.Join(m.dir, fmt.Sprintf("chat_%s_%s.md", channel, safe))
+}
+
+// LoadChatMemory returns per-chat memory, or empty string if none.
+func (m *Memory) LoadChatMemory(channel, chatID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, err := os.ReadFile(m.chatMemoryPath(channel, chatID))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// SaveChatMemory writes per-chat memory.
+func (m *Memory) SaveChatMemory(channel, chatID, content string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if content == "" {
+		return
+	}
+	os.WriteFile(m.chatMemoryPath(channel, chatID), []byte(content), 0o644)
+}
+
 func (m *Memory) SaveMemory(content string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -101,9 +133,16 @@ func (m *Memory) loadMemoryUnlocked() string {
 	return string(data)
 }
 
+// ConsolidateOpts holds optional parameters for consolidation.
+type ConsolidateOpts struct {
+	MaxMemoryBytes int    // trigger compression if MEMORY.md exceeds this (0 = no limit)
+	Channel        string // chat channel (for per-chat memory)
+	ChatID         string // chat ID (for per-chat memory)
+}
+
 // Consolidate uses the LLM to extract knowledge from old session messages
-// into MEMORY.md + HISTORY.md. Returns true on success.
-func (m *Memory) Consolidate(provider *providers.Provider, messages []map[string]any, maxTokens int, temperature float64) bool {
+// into MEMORY.md + HISTORY.md + optional per-chat memory. Returns true on success.
+func (m *Memory) Consolidate(provider *providers.Provider, messages []map[string]any, maxTokens int, temperature float64, opts ...ConsolidateOpts) bool {
 	if len(messages) == 0 {
 		return true
 	}
@@ -161,13 +200,46 @@ func (m *Memory) Consolidate(provider *providers.Provider, messages []map[string
 	currentMemory := m.loadMemoryUnlocked()
 	m.mu.Unlock()
 
-	prompt := fmt.Sprintf(`Process this conversation and call the save_memory tool with your consolidation.
+	// Resolve options
+	var opt ConsolidateOpts
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	maxBytes := opt.MaxMemoryBytes
+
+	sizeHint := ""
+	if maxBytes > 0 {
+		sizeHint = fmt.Sprintf("\n\nIMPORTANT: Keep the memory_update under %d bytes. Be concise — merge duplicates, drop stale info, use short bullet points.", maxBytes)
+	}
+
+	// Load current chat memory if scoped
+	chatMemory := ""
+	if opt.Channel != "" && opt.ChatID != "" {
+		m.mu.Lock()
+		data, _ := os.ReadFile(m.chatMemoryPath(opt.Channel, opt.ChatID))
+		chatMemory = string(data)
+		m.mu.Unlock()
+	}
+
+	chatSection := ""
+	if opt.Channel != "" && opt.ChatID != "" {
+		chatSection = fmt.Sprintf(`
+
+## Current Chat-Specific Memory (channel=%s, chat=%s)
+%s
+
+Separate team-wide facts (memory_update) from chat-specific context (chat_memory_update).
+Team-wide: conventions, people, repos, services — applies to all chats.
+Chat-specific: ongoing investigations, project context, decisions in progress — only this chat.`, opt.Channel, opt.ChatID, chatMemory)
+	}
+
+	prompt := fmt.Sprintf(`Process this conversation and call the save_memory tool with your consolidation.%s%s
 
 ## Current Long-term Memory
 %s
 
 ## Conversation to Process
-%s`, currentMemory, strings.Join(lines, "\n"))
+%s`, sizeHint, chatSection, currentMemory, strings.Join(lines, "\n"))
 
 	llmMessages := []map[string]any{
 		{"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
@@ -187,8 +259,71 @@ func (m *Memory) Consolidate(provider *providers.Provider, messages []map[string
 	}
 
 	args := resp.ToolCalls[0].Arguments
+	var needsCompression bool
+	var updatedMemory string
 
 	// Write results under lock
+	m.mu.Lock()
+	if entry, ok := args["history_entry"].(string); ok && entry != "" {
+		f, err := os.OpenFile(m.historyPath, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err == nil {
+			fmt.Fprintf(f, "\n%s\n", strings.TrimRight(entry, "\n"))
+			f.Close()
+		}
+		log.Printf("[memory] appended history entry (%d chars)", len(entry))
+	}
+	if update, ok := args["memory_update"].(string); ok && update != "" {
+		if update != currentMemory {
+			os.WriteFile(m.memoryPath, []byte(update), 0o644)
+			log.Printf("[memory] updated long-term memory (%d bytes)", len(update))
+			updatedMemory = update
+			needsCompression = opt.MaxMemoryBytes > 0 && len(update) > opt.MaxMemoryBytes
+		}
+	}
+	// Write chat-specific memory
+	if chatUpdate, ok := args["chat_memory_update"].(string); ok && chatUpdate != "" && opt.Channel != "" && opt.ChatID != "" {
+		os.WriteFile(m.chatMemoryPath(opt.Channel, opt.ChatID), []byte(chatUpdate), 0o644)
+		log.Printf("[memory] updated chat memory for %s:%s (%d bytes)", opt.Channel, opt.ChatID, len(chatUpdate))
+	}
+	m.mu.Unlock()
+
+	// Compression pass outside lock (slow LLM call)
+	if needsCompression {
+		log.Printf("[memory] memory too large (%d > %d bytes), running compression", len(updatedMemory), maxBytes)
+		m.compress(provider, updatedMemory, maxBytes, maxTokens, temperature)
+	}
+
+	return true
+}
+
+// compress asks the LLM to make MEMORY.md more concise when it exceeds the size limit.
+func (m *Memory) compress(provider *providers.Provider, current string, maxBytes, maxTokens int, temperature float64) {
+	prompt := fmt.Sprintf(`You are a memory compression agent. The current memory is %d bytes but the limit is %d bytes.
+Rewrite the memory to be more concise while preserving ALL important facts. Merge duplicates, use shorter phrasing, drop stale or obvious info.
+Call the save_memory tool with:
+- history_entry: a one-line note "[YYYY-MM-DD HH:MM] Memory compressed from %d to ~%d bytes"
+- memory_update: the compressed memory (MUST be under %d bytes)
+
+## Current Memory
+%s`, len(current), maxBytes, len(current), maxBytes, maxBytes, current)
+
+	llmMessages := []map[string]any{
+		{"role": "system", "content": "You are a memory compression agent. Make the memory more concise. Call save_memory with the result."},
+		{"role": "user", "content": prompt},
+	}
+
+	resp, err := provider.Chat(llmMessages, saveMemoryTool, maxTokens, temperature)
+	if err != nil {
+		log.Printf("[memory] compression LLM error: %v", err)
+		return
+	}
+	if !resp.HasToolCalls() {
+		log.Println("[memory] compression: LLM did not call save_memory")
+		return
+	}
+
+	args := resp.ToolCalls[0].Arguments
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -198,22 +333,15 @@ func (m *Memory) Consolidate(provider *providers.Provider, messages []map[string
 			fmt.Fprintf(f, "\n%s\n", strings.TrimRight(entry, "\n"))
 			f.Close()
 		}
-		log.Printf("[memory] appended history entry (%d chars)", len(entry))
 	}
-
 	if update, ok := args["memory_update"].(string); ok && update != "" {
-		if update != currentMemory {
-			os.WriteFile(m.memoryPath, []byte(update), 0o644)
-			log.Printf("[memory] updated long-term memory (%d chars)", len(update))
-		}
+		os.WriteFile(m.memoryPath, []byte(update), 0o644)
+		log.Printf("[memory] compressed memory: %d -> %d bytes", len(current), len(update))
 	}
-
-	return true
 }
 
-// ConsolidateJSON is like Consolidate but takes raw JSONL message bytes
-// (for when we need to consolidate from a session file).
-func (m *Memory) ConsolidateJSON(provider *providers.Provider, rawMessages []json.RawMessage, maxTokens int, temperature float64) bool {
+// ConsolidateJSON is like Consolidate but takes raw JSONL message bytes.
+func (m *Memory) ConsolidateJSON(provider *providers.Provider, rawMessages []json.RawMessage, maxTokens int, temperature float64, opts ...ConsolidateOpts) bool {
 	var messages []map[string]any
 	for _, raw := range rawMessages {
 		var msg map[string]any
@@ -223,5 +351,5 @@ func (m *Memory) ConsolidateJSON(provider *providers.Provider, rawMessages []jso
 			}
 		}
 	}
-	return m.Consolidate(provider, messages, maxTokens, temperature)
+	return m.Consolidate(provider, messages, maxTokens, temperature, opts...)
 }

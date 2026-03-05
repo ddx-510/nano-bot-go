@@ -17,6 +17,7 @@ import (
 	"github.com/PlatoX-Type/monet-bot/bus"
 	"github.com/PlatoX-Type/monet-bot/config"
 	"github.com/PlatoX-Type/monet-bot/cron"
+	"github.com/PlatoX-Type/monet-bot/hooks"
 	"github.com/PlatoX-Type/monet-bot/providers"
 	"github.com/PlatoX-Type/monet-bot/tools"
 )
@@ -32,12 +33,14 @@ type Loop struct {
 	Workspace       string
 	CronService     *cron.Service
 	SubagentManager *tools.SubagentManager
+	Emitter         *hooks.Emitter // nil when dashboard is disabled
 
 	// Per-session concurrency: each session gets a worker goroutine with a queue.
 	// Different sessions run fully in parallel; same session processes in FIFO order.
 	mu             sync.Mutex
 	activeTasks    map[string]context.CancelFunc // sessionKey -> cancel (for /stop)
 	sessionWorkers sync.Map                      // sessionKey -> *sessionWorker
+	consolidating  sync.Map                      // sessionKey -> bool (prevents double-consolidation)
 }
 
 // sessionWorker is a per-session message queue with its own goroutine.
@@ -128,6 +131,18 @@ func (l *Loop) Run() {
 			continue
 		}
 
+		// Emit message.received for non-system messages
+		l.Emitter.Emit(hooks.Event{
+			Type:      hooks.EventMessageReceived,
+			SessionID: msg.Channel + ":" + msg.ChatID,
+			Data: map[string]any{
+				"channel": msg.Channel,
+				"chat_id": msg.ChatID,
+				"user":    msg.User,
+				"text":    msg.Text,
+			},
+		})
+
 		// /stop needs immediate execution — bypass the queue to cancel tasks
 		text := strings.TrimSpace(msg.Text)
 		if strings.EqualFold(text, "/stop") {
@@ -141,22 +156,22 @@ func (l *Loop) Run() {
 
 		// If the worker is busy, send an immediate ack so the user knows we're queued
 		if w.busy.Load() && !strings.HasPrefix(text, "/") {
-			l.Bus.Outbound <- bus.OutboundMessage{
+			l.sendOutbound(bus.OutboundMessage{
 				Channel: msg.Channel,
 				ChatID:  msg.ChatID,
 				Text:    "\U0001f504 收到，处理完当前任务后马上处理你的。",
-			}
+			})
 		}
 
 		// Queue the message (non-blocking with overflow protection)
 		select {
 		case w.inbox <- msg:
 		default:
-			l.Bus.Outbound <- bus.OutboundMessage{
+			l.sendOutbound(bus.OutboundMessage{
 				Channel: msg.Channel,
 				ChatID:  msg.ChatID,
 				Text:    "\u26a0\ufe0f 当前排队太多，请稍后再试。",
-			}
+			})
 		}
 	}
 }
@@ -195,10 +210,17 @@ func (l *Loop) process(msg bus.InboundMessage) {
 	// Check if memory consolidation is needed
 	l.maybeConsolidate(msg.Channel, msg.ChatID)
 
+	sessionKey := msg.Channel + ":" + msg.ChatID
+
+	l.Emitter.Emit(hooks.Event{
+		Type:      hooks.EventSessionStarted,
+		SessionID: sessionKey,
+		Data:      map[string]any{"channel": msg.Channel, "chat_id": msg.ChatID, "text": msg.Text},
+	})
+
 	// Set up cancellable context (only cancelled by /stop, not by new messages).
 	// Since same-session messages are serialized via the worker queue, there's
 	// only ever one active task per session — no need for generation counters.
-	sessionKey := msg.Channel + ":" + msg.ChatID
 	ctx, cancel := context.WithCancel(context.Background())
 	l.mu.Lock()
 	l.activeTasks[sessionKey] = cancel
@@ -257,6 +279,10 @@ func (l *Loop) process(msg bus.InboundMessage) {
 	// If cancelled by /stop, don't save or send the response
 	if ctx.Err() != nil {
 		log.Printf("[agent] task cancelled for session %s", sessionKey)
+		l.Emitter.Emit(hooks.Event{
+			Type:      hooks.EventSessionCancelled,
+			SessionID: sessionKey,
+		})
 		return
 	}
 
@@ -264,16 +290,19 @@ func (l *Loop) process(msg bus.InboundMessage) {
 	l.Sessions.Append(msg.Channel, msg.ChatID, map[string]any{"role": "assistant", "content": final})
 
 	// Skip sending if the message tool already sent output this turn
-	if reqMsgTool.SentInTurn() {
-		return
+	if !reqMsgTool.SentInTurn() {
+		l.sendOutbound(bus.OutboundMessage{
+			Channel: msg.Channel,
+			ChatID:  msg.ChatID,
+			Text:    final,
+		})
 	}
 
-	// Send response
-	l.Bus.Outbound <- bus.OutboundMessage{
-		Channel: msg.Channel,
-		ChatID:  msg.ChatID,
-		Text:    final,
-	}
+	l.Emitter.Emit(hooks.Event{
+		Type:      hooks.EventSessionCompleted,
+		SessionID: sessionKey,
+		Data:      map[string]any{"response": final},
+	})
 }
 
 // processSystemMessage handles subagent result announcements.
@@ -314,15 +343,12 @@ func (l *Loop) processSystemMessage(msg bus.InboundMessage) {
 	// Save to session
 	l.Sessions.Append(channel, chatID, map[string]any{"role": "assistant", "content": final})
 
-	if reqMsgTool.SentInTurn() {
-		return
-	}
-
-	// Send response
-	l.Bus.Outbound <- bus.OutboundMessage{
-		Channel: channel,
-		ChatID:  chatID,
-		Text:    final,
+	if !reqMsgTool.SentInTurn() {
+		l.sendOutbound(bus.OutboundMessage{
+			Channel: channel,
+			ChatID:  chatID,
+			Text:    final,
+		})
 	}
 }
 
@@ -335,6 +361,13 @@ func (l *Loop) reactLoop(ctx context.Context, messages []map[string]any, channel
 		if ctx.Err() != nil {
 			return "\u23f9 Task stopped."
 		}
+
+		sessionID := channel + ":" + chatID
+		l.Emitter.Emit(hooks.Event{
+			Type:      hooks.EventLLMRequest,
+			SessionID: sessionID,
+			Data:      map[string]any{"iteration": i},
+		})
 
 		resp, err := l.Provider.Chat(messages, schemas, l.Config.LLM.MaxTokens, l.Config.LLM.Temperature)
 		if err != nil {
@@ -349,6 +382,15 @@ func (l *Loop) reactLoop(ctx context.Context, messages []map[string]any, channel
 				return fmt.Sprintf("LLM error: %v", err)
 			}
 		}
+
+		l.Emitter.Emit(hooks.Event{
+			Type:      hooks.EventLLMResponse,
+			SessionID: sessionID,
+			Data: map[string]any{
+				"has_tool_calls": resp.HasToolCalls(),
+				"content_length": len(resp.Content),
+			},
+		})
 
 		if !resp.HasToolCalls() {
 			content := thinkRe.ReplaceAllString(resp.Content, "")
@@ -371,11 +413,11 @@ func (l *Loop) reactLoop(ctx context.Context, messages []map[string]any, channel
 			} else {
 				text = "\xe2\x9a\x99\xef\xb8\x8f [working...]"
 			}
-			l.Bus.Outbound <- bus.OutboundMessage{
+			l.sendOutbound(bus.OutboundMessage{
 				Channel: channel,
 				ChatID:  chatID,
 				Text:    text,
-			}
+			})
 		}
 
 		// Build assistant message with tool calls
@@ -401,7 +443,21 @@ func (l *Loop) reactLoop(ctx context.Context, messages []map[string]any, channel
 				return "\u23f9 Task stopped."
 			}
 			log.Printf("[agent] tool: %s(%v)", tc.Name, tc.Arguments)
+
+			l.Emitter.Emit(hooks.Event{
+				Type:      hooks.EventToolStart,
+				SessionID: sessionID,
+				Data:      map[string]any{"tool": tc.Name, "args": tc.Arguments},
+			})
+
 			result := reqTools.Execute(tc.Name, tc.Arguments)
+
+			l.Emitter.Emit(hooks.Event{
+				Type:      hooks.EventToolEnd,
+				SessionID: sessionID,
+				Data:      map[string]any{"tool": tc.Name, "result_length": len(result)},
+			})
+
 			messages = append(messages, map[string]any{
 				"role":         "tool",
 				"tool_call_id": tc.ID,
@@ -411,6 +467,20 @@ func (l *Loop) reactLoop(ctx context.Context, messages []map[string]any, channel
 	}
 
 	return "(max iterations reached)"
+}
+
+// sendOutbound sends an outbound message and emits a message.sent event.
+func (l *Loop) sendOutbound(msg bus.OutboundMessage) {
+	l.Bus.Outbound <- msg
+	l.Emitter.Emit(hooks.Event{
+		Type:      hooks.EventMessageSent,
+		SessionID: msg.Channel + ":" + msg.ChatID,
+		Data: map[string]any{
+			"channel": msg.Channel,
+			"chat_id": msg.ChatID,
+			"text":    msg.Text,
+		},
+	})
 }
 
 func (l *Loop) handleCommand(msg bus.InboundMessage) {
@@ -424,7 +494,11 @@ func (l *Loop) handleCommand(msg bus.InboundMessage) {
 		unconsolidated := allMsgs[lastConsolidated:]
 		if len(unconsolidated) > 0 {
 			log.Printf("[memory] /new: consolidating %d messages before clear", len(unconsolidated))
-			ok := l.Memory.Consolidate(l.Provider, unconsolidated, l.Config.LLM.MaxTokens, l.Config.LLM.Temperature)
+			ok := l.Memory.Consolidate(l.Provider, unconsolidated, l.Config.LLM.MaxTokens, l.Config.LLM.Temperature, ConsolidateOpts{
+				MaxMemoryBytes: l.Config.MaxMemoryBytes,
+				Channel:        msg.Channel,
+				ChatID:         msg.ChatID,
+			})
 			if ok {
 				reply = "\U0001f9e0 Memory saved. Session cleared."
 			} else {
@@ -441,7 +515,12 @@ func (l *Loop) handleCommand(msg bus.InboundMessage) {
 		reply = "Use /stop directly (it bypasses the queue)."
 
 	case "/memory":
-		reply = fmt.Sprintf("```\n%s\n```", l.Memory.LoadMemory())
+		global := l.Memory.LoadMemory()
+		chatMem := l.Memory.LoadChatMemory(msg.Channel, msg.ChatID)
+		reply = fmt.Sprintf("**Global Memory:**\n```\n%s\n```", global)
+		if chatMem != "" {
+			reply += fmt.Sprintf("\n\n**Chat Memory:**\n```\n%s\n```", chatMem)
+		}
 
 	case "/skills":
 		if len(l.Skills) == 0 {
@@ -468,7 +547,13 @@ func (l *Loop) handleCommand(msg bus.InboundMessage) {
 		reply = fmt.Sprintf("Unknown command: %s. Try /help", cmd)
 	}
 
-	l.Bus.Outbound <- bus.OutboundMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: reply}
+	l.Emitter.Emit(hooks.Event{
+		Type:      hooks.EventCommandExecuted,
+		SessionID: msg.Channel + ":" + msg.ChatID,
+		Data:      map[string]any{"command": cmd},
+	})
+
+	l.sendOutbound(bus.OutboundMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: reply})
 }
 
 // handleStop processes /stop immediately (bypasses session queue).
@@ -495,20 +580,26 @@ func (l *Loop) handleStop(msg bus.InboundMessage) {
 	} else {
 		reply = "No active task to stop."
 	}
-	l.Bus.Outbound <- bus.OutboundMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: reply}
+	l.sendOutbound(bus.OutboundMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: reply})
 }
 
 // maybeConsolidate checks if the session has accumulated enough unconsolidated
-// messages and runs LLM memory consolidation if so.
+// messages and fires async LLM memory consolidation if so.
+// Non-blocking — runs in a background goroutine so the user isn't waiting.
 func (l *Loop) maybeConsolidate(channel, chatID string) {
+	sessionKey := channel + ":" + chatID
+
+	// Skip if already consolidating this session
+	if _, running := l.consolidating.Load(sessionKey); running {
+		return
+	}
+
 	total, lastConsolidated := l.Sessions.MessageCount(channel, chatID)
 	unconsolidated := total - lastConsolidated
 
 	if unconsolidated < l.Config.MemoryWindow {
 		return
 	}
-
-	log.Printf("[memory] auto-consolidation triggered: %d unconsolidated messages (window=%d)", unconsolidated, l.Config.MemoryWindow)
 
 	allMsgs, _ := l.Sessions.LoadAll(channel, chatID)
 	keepCount := l.Config.MemoryWindow / 2
@@ -519,13 +610,32 @@ func (l *Loop) maybeConsolidate(channel, chatID string) {
 	if endIdx <= lastConsolidated {
 		return
 	}
-	toConsolidate := allMsgs[lastConsolidated:endIdx]
+	toConsolidate := make([]map[string]any, len(allMsgs[lastConsolidated:endIdx]))
+	copy(toConsolidate, allMsgs[lastConsolidated:endIdx])
 
-	ok := l.Memory.Consolidate(l.Provider, toConsolidate, l.Config.LLM.MaxTokens, l.Config.LLM.Temperature)
-	if ok {
-		l.Sessions.UpdateConsolidated(channel, chatID, endIdx)
-		log.Printf("[memory] consolidated %d messages, new pointer=%d", len(toConsolidate), endIdx)
-	}
+	// Mark as consolidating and fire async
+	l.consolidating.Store(sessionKey, true)
+	log.Printf("[memory] async consolidation started: %d messages (window=%d)", len(toConsolidate), l.Config.MemoryWindow)
+
+	go func() {
+		defer l.consolidating.Delete(sessionKey)
+		ok := l.Memory.Consolidate(l.Provider, toConsolidate, l.Config.LLM.MaxTokens, l.Config.LLM.Temperature, ConsolidateOpts{
+			MaxMemoryBytes: l.Config.MaxMemoryBytes,
+			Channel:        channel,
+			ChatID:         chatID,
+		})
+		if ok {
+			l.Sessions.UpdateConsolidated(channel, chatID, endIdx)
+			log.Printf("[memory] async consolidation done: %d messages, new pointer=%d", len(toConsolidate), endIdx)
+			l.Emitter.Emit(hooks.Event{
+				Type:      hooks.EventMemoryUpdated,
+				SessionID: sessionKey,
+				Data:      map[string]any{"messages_consolidated": len(toConsolidate)},
+			})
+		} else {
+			log.Printf("[memory] async consolidation failed for %s", sessionKey)
+		}
+	}()
 }
 
 func toolHint(name string, args map[string]any) string {

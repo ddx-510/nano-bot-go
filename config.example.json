@@ -39,5 +39,9 @@
   },
   "max_iterations": 20,
   "memory_window": 50,
-  "brave_api_key": ""
+  "brave_api_key": "",
+  "dashboard": {
+    "enabled": false,
+    "port": 8080
+  }
 }

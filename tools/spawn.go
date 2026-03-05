@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"github.com/PlatoX-Type/monet-bot/bus"
+	"github.com/PlatoX-Type/monet-bot/hooks"
 	"github.com/PlatoX-Type/monet-bot/providers"
 )
 
@@ -23,6 +24,7 @@ type SubagentManager struct {
 	Bus         *bus.MessageBus
 	MaxTokens   int
 	Temperature float64
+	Emitter     *hooks.Emitter // nil when dashboard is disabled
 
 	mu     sync.Mutex
 	nextID atomic.Int64
@@ -93,6 +95,11 @@ func (m *SubagentManager) Spawn(task, label, channel, chatID string) string {
 	go m.run(ctx, id, task, label, channel, chatID, sessionKey)
 
 	log.Printf("[spawn] started subagent [%s]: %s", id, label)
+	m.Emitter.Emit(hooks.Event{
+		Type:      hooks.EventSubagentStarted,
+		SessionID: sessionKey,
+		Data:      map[string]any{"id": id, "label": label, "task": task},
+	})
 	return fmt.Sprintf("Subagent [%s] started (id: %s). I'll notify you when it completes.", label, id)
 }
 
@@ -184,6 +191,11 @@ func (m *SubagentManager) run(ctx context.Context, id, task, label, channel, cha
 		status = "was cancelled"
 	}
 	log.Printf("[spawn] subagent [%s] %s", id, status)
+	m.Emitter.Emit(hooks.Event{
+		Type:      hooks.EventSubagentCompleted,
+		SessionID: sessionKey,
+		Data:      map[string]any{"id": id, "label": label, "status": status},
+	})
 
 	announceContent := fmt.Sprintf(`[Subagent '%s' %s]
 

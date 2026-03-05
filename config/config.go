@@ -50,6 +50,11 @@ type HeartbeatConfig struct {
 	IntervalMinutes int  `json:"interval_minutes"`
 }
 
+type DashboardConfig struct {
+	Enabled bool `json:"enabled"`
+	Port    int  `json:"port,omitempty"` // default 8080
+}
+
 type Config struct {
 	Mode          string          `json:"mode"`               // "local" or "cloud" (default: "local")
 	Workspace     string          `json:"workspace"`
@@ -57,10 +62,12 @@ type Config struct {
 	Repos         []RepoConfig    `json:"repos"`
 	Services      []ServiceConfig `json:"services"`
 	Channels      []ChannelConfig `json:"channels"`
-	Heartbeat     HeartbeatConfig `json:"heartbeat"`
+	Heartbeat     HeartbeatConfig  `json:"heartbeat"`
+	Dashboard     DashboardConfig  `json:"dashboard,omitempty"`
 	Cron          []CronJobConfig `json:"cron,omitempty"`
-	MaxIter       int             `json:"max_iterations"`
-	MemoryWindow  int             `json:"memory_window"`
+	MaxIter        int             `json:"max_iterations"`
+	MemoryWindow   int             `json:"memory_window"`
+	MaxMemoryBytes int             `json:"max_memory_bytes,omitempty"` // max MEMORY.md size before compression (default 4096)
 	BraveAPIKey   string          `json:"brave_api_key"`
 	SendProgress  *bool           `json:"send_progress,omitempty"`   // send "working on..." progress messages (default true)
 	SendToolHints *bool           `json:"send_tool_hints,omitempty"` // send detailed tool call descriptions (default false)
@@ -109,7 +116,8 @@ func defaultConfig() *Config {
 			Temperature: 0.3,
 		},
 		Heartbeat:    HeartbeatConfig{Enabled: false, IntervalMinutes: 30},
-		MaxIter:      20,
-		MemoryWindow: 50,
+		MaxIter:        20,
+		MemoryWindow:   50,
+		MaxMemoryBytes: 4096,
 	}
 }
