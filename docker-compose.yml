@@ -1,0 +1,18 @@
+services:
+  monet-bot:
+    build: .
+    container_name: monet-bot
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # Lark webhook
+      - "8080:8080"   # Dashboard
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - monet-data:/app/workspace
+    environment:
+      - TZ=Asia/Singapore
+    # First run: copy default workspace files if volume is empty
+    entrypoint: ["/bin/sh", "-c", "cp -rn /app/workspace-default/* /app/workspace/ 2>/dev/null; exec monet-bot run --channel all"]
+
+volumes:
+  monet-data:

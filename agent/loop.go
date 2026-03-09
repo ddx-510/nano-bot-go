@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/PlatoX-Type/monet-bot/bus"
 	"github.com/PlatoX-Type/monet-bot/config"
@@ -35,18 +36,18 @@ type Loop struct {
 	SubagentManager *tools.SubagentManager
 	Emitter         *hooks.Emitter // nil when dashboard is disabled
 
-	// Per-session concurrency: each session gets a worker goroutine with a queue.
-	// Different sessions run fully in parallel; same session processes in FIFO order.
+	// Concurrency: each message spawns its own goroutine.
+	// /stop cancels all active tasks for a session.
 	mu             sync.Mutex
-	activeTasks    map[string]context.CancelFunc // sessionKey -> cancel (for /stop)
-	sessionWorkers sync.Map                      // sessionKey -> *sessionWorker
-	consolidating  sync.Map                      // sessionKey -> bool (prevents double-consolidation)
+	activeTasks    map[string]map[int64]*taskInfo // sessionKey -> taskID -> info
+	taskCounter    atomic.Int64                   // global task ID counter
+	consolidating  sync.Map                       // sessionKey -> bool (prevents double-consolidation)
 }
 
-// sessionWorker is a per-session message queue with its own goroutine.
-type sessionWorker struct {
-	inbox chan bus.InboundMessage
-	busy  atomic.Bool // true while processing a message
+type taskInfo struct {
+	Cancel  context.CancelFunc
+	Text    string    // original message text (truncated)
+	Started time.Time
 }
 
 func NewLoop(cfg *config.Config, provider *providers.Provider, mb *bus.MessageBus, cronSvc *cron.Service) *Loop {
@@ -65,7 +66,7 @@ func NewLoop(cfg *config.Config, provider *providers.Provider, mb *bus.MessageBu
 		Workspace:       workspace,
 		CronService:     cronSvc,
 		SubagentManager: subMgr,
-		activeTasks: make(map[string]context.CancelFunc),
+		activeTasks: make(map[string]map[int64]*taskInfo),
 	}
 	l.registerTools()
 	return l
@@ -119,13 +120,13 @@ func (l *Loop) registerTools() {
 	}
 }
 
-// Run routes inbound messages to per-session worker goroutines.
-// Different sessions run fully in parallel. Same session processes FIFO.
-// /stop bypasses the queue for immediate cancellation.
+// Run routes inbound messages. Every message spawns its own goroutine —
+// both cross-chat and same-chat messages run fully in parallel.
+// /stop cancels all active tasks for the session.
 func (l *Loop) Run() {
-	log.Println("[agent] loop started (concurrent, per-session queues)")
+	log.Println("[agent] loop started (fully concurrent)")
 	for msg := range l.Bus.Inbound {
-		// System messages (subagent results) bypass the session queue
+		// System messages (subagent results)
 		if msg.Channel == "system" {
 			go l.processSystemMessage(msg)
 			continue
@@ -143,59 +144,15 @@ func (l *Loop) Run() {
 			},
 		})
 
-		// /stop needs immediate execution — bypass the queue to cancel tasks
+		// /stop needs immediate execution
 		text := strings.TrimSpace(msg.Text)
 		if strings.EqualFold(text, "/stop") {
 			go l.handleStop(msg)
 			continue
 		}
 
-		// Route to per-session worker
-		key := msg.Channel + ":" + msg.ChatID
-		w := l.getOrCreateWorker(key)
-
-		// If the worker is busy, send an immediate ack so the user knows we're queued
-		if w.busy.Load() && !strings.HasPrefix(text, "/") {
-			l.sendOutbound(bus.OutboundMessage{
-				Channel: msg.Channel,
-				ChatID:  msg.ChatID,
-				Text:    "\U0001f504 收到，处理完当前任务后马上处理你的。",
-			})
-		}
-
-		// Queue the message (non-blocking with overflow protection)
-		select {
-		case w.inbox <- msg:
-		default:
-			l.sendOutbound(bus.OutboundMessage{
-				Channel: msg.Channel,
-				ChatID:  msg.ChatID,
-				Text:    "\u26a0\ufe0f 当前排队太多，请稍后再试。",
-			})
-		}
-	}
-}
-
-// getOrCreateWorker returns the session worker, creating one if needed.
-func (l *Loop) getOrCreateWorker(key string) *sessionWorker {
-	if wI, ok := l.sessionWorkers.Load(key); ok {
-		return wI.(*sessionWorker)
-	}
-	w := &sessionWorker{inbox: make(chan bus.InboundMessage, 20)}
-	actual, loaded := l.sessionWorkers.LoadOrStore(key, w)
-	if !loaded {
-		go l.runSessionWorker(key, w)
-	}
-	return actual.(*sessionWorker)
-}
-
-// runSessionWorker is the goroutine for a session — processes messages in FIFO order.
-func (l *Loop) runSessionWorker(key string, w *sessionWorker) {
-	log.Printf("[agent] session worker started: %s", key)
-	for msg := range w.inbox {
-		w.busy.Store(true)
-		l.process(msg)
-		w.busy.Store(false)
+		// Spawn a goroutine for every message — fully concurrent
+		go l.process(msg)
 	}
 }
 
@@ -206,6 +163,13 @@ func (l *Loop) process(msg bus.InboundMessage) {
 		l.handleCommand(msg)
 		return
 	}
+
+	// Immediate ack so the user knows we're processing
+	l.sendOutbound(bus.OutboundMessage{
+		Channel: msg.Channel,
+		ChatID:  msg.ChatID,
+		Text:    "\U0001f504 收到，处理中...",
+	})
 
 	// Check if memory consolidation is needed
 	l.maybeConsolidate(msg.Channel, msg.ChatID)
@@ -218,17 +182,30 @@ func (l *Loop) process(msg bus.InboundMessage) {
 		Data:      map[string]any{"channel": msg.Channel, "chat_id": msg.ChatID, "text": msg.Text},
 	})
 
-	// Set up cancellable context (only cancelled by /stop, not by new messages).
-	// Since same-session messages are serialized via the worker queue, there's
-	// only ever one active task per session — no need for generation counters.
+	// Set up cancellable context. Each task gets a unique ID so /stop can cancel all.
 	ctx, cancel := context.WithCancel(context.Background())
+	taskID := l.taskCounter.Add(1)
+	taskText := msg.Text
+	if len(taskText) > 80 {
+		taskText = taskText[:80] + "..."
+	}
 	l.mu.Lock()
-	l.activeTasks[sessionKey] = cancel
+	if l.activeTasks[sessionKey] == nil {
+		l.activeTasks[sessionKey] = make(map[int64]*taskInfo)
+	}
+	l.activeTasks[sessionKey][taskID] = &taskInfo{
+		Cancel:  cancel,
+		Text:    taskText,
+		Started: time.Now(),
+	}
 	l.mu.Unlock()
 	defer func() {
 		cancel()
 		l.mu.Lock()
-		delete(l.activeTasks, sessionKey)
+		delete(l.activeTasks[sessionKey], taskID)
+		if len(l.activeTasks[sessionKey]) == 0 {
+			delete(l.activeTasks, sessionKey)
+		}
 		l.mu.Unlock()
 	}()
 
@@ -533,14 +510,31 @@ func (l *Loop) handleCommand(msg bus.InboundMessage) {
 			reply = "Available skills:\n" + strings.Join(lines, "\n")
 		}
 
+	case "/queue":
+		l.mu.Lock()
+		var lines []string
+		total := 0
+		for session, tasks := range l.activeTasks {
+			for _, ti := range tasks {
+				elapsed := time.Since(ti.Started).Truncate(time.Second)
+				lines = append(lines, fmt.Sprintf("- [%s] `%s` (%s)", session, ti.Text, elapsed))
+				total++
+			}
+		}
+		l.mu.Unlock()
+		if total == 0 {
+			reply = "No active tasks."
+		} else {
+			reply = fmt.Sprintf("\U0001f4cb **%d active task(s):**\n%s", total, strings.Join(lines, "\n"))
+		}
+
 	case "/help":
 		reply = "\U0001f916 **CCMonet Bot Commands:**\n" +
 			"- `/new` \u2014 Save memory & clear session\n" +
 			"- `/stop` \u2014 Stop active tasks\n" +
+			"- `/queue` \u2014 Show active tasks\n" +
 			"- `/memory` \u2014 Show team memory\n" +
 			"- `/skills` \u2014 List skills\n" +
-			"- `/continue` \u2014 Respond to all messages (no @mention needed)\n" +
-			"- `/atmode` \u2014 Only respond when @mentioned (default)\n" +
 			"- `/help` \u2014 Show this help"
 
 	default:
@@ -556,18 +550,21 @@ func (l *Loop) handleCommand(msg bus.InboundMessage) {
 	l.sendOutbound(bus.OutboundMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: reply})
 }
 
-// handleStop processes /stop immediately (bypasses session queue).
-// Cancels the active task and subagents. Queued messages continue processing.
+// handleStop processes /stop immediately.
+// Cancels ALL active tasks for the session and subagents.
 func (l *Loop) handleStop(msg bus.InboundMessage) {
 	sessionKey := msg.Channel + ":" + msg.ChatID
 	cancelled := 0
 
-	// Cancel the active LLM task
+	// Cancel all active LLM tasks for this session
 	l.mu.Lock()
-	if cancel, ok := l.activeTasks[sessionKey]; ok {
-		cancel()
+	if tasks, ok := l.activeTasks[sessionKey]; ok {
+		for id, ti := range tasks {
+			ti.Cancel()
+			delete(tasks, id)
+			cancelled++
+		}
 		delete(l.activeTasks, sessionKey)
-		cancelled++
 	}
 	l.mu.Unlock()
 

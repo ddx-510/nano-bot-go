@@ -13,7 +13,7 @@ nanobot proved that a full-featured AI agent can fit in ~4,000 lines of Python. 
 | Core code | ~4,000 lines | ~5,000 lines |
 | Runtime | Single-thread asyncio | Multi-goroutine, per-session workers |
 | Cross-chat concurrency | Serialized (global lock) | Fully parallel |
-| Same-chat concurrency | Serialized | Queued FIFO with ack |
+| Same-chat concurrency | Serialized | Fully parallel |
 | Tool isolation | Shared singleton | Per-request clone |
 | Compilation | Interpreted | Single static binary |
 
@@ -188,10 +188,6 @@ A built-in web UI served from a single embedded HTML file. Acts as both a **Chan
 
 When enabled, the dashboard is accessible at `http://localhost:<port>`. Late-joining clients receive the last 200 events from a ring buffer.
 
-### Knowledge Base Integration
-
-The agent can be configured with a product knowledge base repo (e.g. PRD documents, feature specifications). When configured, the agent checks the knowledge base **first** before diving into code repos for product/feature questions. This dramatically reduces unnecessary code exploration for questions that are already documented.
-
 ### LLM Providers
 Auto-detection from API key or model name. 12+ providers supported:
 
@@ -233,7 +229,7 @@ graph LR
 ```
 
 - **Different chats** -> fully parallel (separate goroutines, isolated tool state)
-- **Same chat** -> FIFO queue (no lost messages, no conflicts)
+- **Same chat** -> fully parallel (each message gets its own goroutine)
 - **New message while busy** -> immediate ack
 - **`/stop`** -> cancels the current task (queued messages still process)
 
@@ -511,13 +507,10 @@ workspace/
 ├── TEAM.md              # Team identity map (auto-updated)
 ├── HEARTBEAT.md         # Periodic health check tasks
 ├── skills/
-│   ├── cc-refine-prd/   # PRD refinement skill
-│   ├── cc-review-prd/   # PRD review skill
-│   └── ...              # More skills
+│   └── ...              # Custom skills
 ├── repos/
 │   ├── ccmonet-go/      # Cloned repos (read-only)
 │   ├── ccmonet-web/
-│   ├── ccmonet-prd/     # Product knowledge base
 │   └── curiosity/
 ├── memory/
 │   ├── MEMORY.md        # Long-term team memory

@@ -15,11 +15,12 @@ type LLMConfig struct {
 }
 
 type RepoConfig struct {
-	Name        string `json:"name"`
-	Path        string `json:"path"`
-	Remote      string `json:"remote,omitempty"`       // HTTPS+PAT for cloud mode
-	RemoteLocal string `json:"remote_local,omitempty"` // SSH for local mode
-	Branch      string `json:"branch"`
+	Name        string            `json:"name"`
+	Path        string            `json:"path"`
+	Remote      string            `json:"remote,omitempty"`       // HTTPS+PAT for cloud mode
+	RemoteLocal string            `json:"remote_local,omitempty"` // SSH for local mode
+	Branch      string            `json:"branch"`                 // default branch (fallback)
+	Branches    map[string]string `json:"branches,omitempty"`     // per-environment: {"development":"develop","production":"release-*"}
 }
 
 type ServiceConfig struct {
@@ -57,13 +58,14 @@ type DashboardConfig struct {
 
 type Config struct {
 	Mode          string          `json:"mode"`               // "local" or "cloud" (default: "local")
+	Environment   string          `json:"environment"`        // "development" or "production" (default: "development")
 	Workspace     string          `json:"workspace"`
 	LLM           LLMConfig       `json:"llm"`
 	Repos         []RepoConfig    `json:"repos"`
 	Services      []ServiceConfig `json:"services"`
 	Channels      []ChannelConfig `json:"channels"`
 	Heartbeat     HeartbeatConfig  `json:"heartbeat"`
-	Dashboard     DashboardConfig  `json:"dashboard,omitempty"`
+	Dashboard     DashboardConfig   `json:"dashboard,omitempty"`
 	Cron          []CronJobConfig `json:"cron,omitempty"`
 	MaxIter        int             `json:"max_iterations"`
 	MemoryWindow   int             `json:"memory_window"`
@@ -92,6 +94,26 @@ func (c *Config) ToolHintsEnabled() bool {
 		return false
 	}
 	return *c.SendToolHints
+}
+
+// Env returns the active environment, defaulting to "development".
+func (c *Config) Env() string {
+	if c.Environment == "" {
+		return "development"
+	}
+	return c.Environment
+}
+
+// RepoBranch returns the branch for a repo in the active environment.
+// Priority: branches[environment] > branch (fallback).
+// Supports glob patterns like "release-*" — the repo manager resolves these.
+func (c *Config) RepoBranch(repo RepoConfig) string {
+	if repo.Branches != nil {
+		if b, ok := repo.Branches[c.Env()]; ok && b != "" {
+			return b
+		}
+	}
+	return repo.Branch
 }
 
 func Load(path string) (*Config, error) {

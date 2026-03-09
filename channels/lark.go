@@ -24,13 +24,11 @@ type LarkChannel struct {
 	workspace string
 	allowFrom map[string]bool
 
+	botOpenID string // bot's own open_id, fetched at startup
+
 	token    string
 	tokenMu  sync.Mutex
 	tokenExp time.Time
-
-	// Per-chat trigger mode: true = continue (respond to all), false = @ mode (only @mentions)
-	chatModes map[string]bool
-	modesMu   sync.RWMutex
 }
 
 func NewLark(mb *bus.MessageBus, appID, appSecret string, allowFrom []string, port int, workspace string) *LarkChannel {
@@ -48,13 +46,15 @@ func NewLark(mb *bus.MessageBus, appID, appSecret string, allowFrom []string, po
 		port:      port,
 		workspace: workspace,
 		allowFrom: af,
-		chatModes: make(map[string]bool),
 	}
 }
 
 func (l *LarkChannel) Name() string { return "lark" }
 
 func (l *LarkChannel) Start() {
+	// Fetch the bot's own open_id so we can detect @bot mentions
+	l.fetchBotID()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/lark/event", l.handleEvent)
 	mux.HandleFunc("/lark/health", func(w http.ResponseWriter, r *http.Request) {
@@ -68,17 +68,6 @@ func (l *LarkChannel) Start() {
 	}
 }
 
-func (l *LarkChannel) isContinueMode(chatID string) bool {
-	l.modesMu.RLock()
-	defer l.modesMu.RUnlock()
-	return l.chatModes[chatID]
-}
-
-func (l *LarkChannel) setMode(chatID string, continueMode bool) {
-	l.modesMu.Lock()
-	defer l.modesMu.Unlock()
-	l.chatModes[chatID] = continueMode
-}
 
 func (l *LarkChannel) handleEvent(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
@@ -114,11 +103,11 @@ func (l *LarkChannel) handleEvent(w http.ResponseWriter, r *http.Request) {
 	msgID, _ := msg["message_id"].(string)
 	contentStr, _ := msg["content"].(string)
 
-	log.Printf("[lark] event: type=%s id=%s content=%s", msgType, msgID, contentStr)
-
 	senderID, _ := sender["sender_id"].(map[string]any)
 	userID, _ := senderID["open_id"].(string)
 	chatID, _ := msg["chat_id"].(string)
+
+	log.Printf("[lark] event: type=%s chat=%s from=%s id=%s content=%s", msgType, chatID, userID, msgID, contentStr)
 
 	// ACL check
 	if len(l.allowFrom) > 0 && !l.allowFrom[userID] {
@@ -140,12 +129,18 @@ func (l *LarkChannel) handleEvent(w http.ResponseWriter, r *http.Request) {
 		var content map[string]string
 		json.Unmarshal([]byte(contentStr), &content)
 		rawText := strings.TrimSpace(content["text"])
-		wasMentioned = strings.HasPrefix(rawText, "@")
+		wasMentioned = l.isBotMentioned(mentionMap)
 		text = rawText
-		if wasMentioned && strings.Contains(text, " ") {
-			text = strings.TrimSpace(text[strings.Index(text, " ")+1:])
+		// Strip the bot's @mention placeholder from the beginning of the text
+		if wasMentioned {
+			for _, m := range mentionMap {
+				if m.OpenID == l.botOpenID && m.Key != "" {
+					text = strings.TrimSpace(strings.Replace(text, m.Key, "", 1))
+					break
+				}
+			}
 		}
-		// Resolve @_user_N placeholders to real names
+		// Resolve remaining @_user_N placeholders to real names
 		text = resolveMentions(text, mentionMap)
 
 	case "image":
@@ -183,31 +178,8 @@ func (l *LarkChannel) handleEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle mode switch commands (always respond regardless of mode)
-	cmdLower := strings.ToLower(strings.TrimSpace(text))
-	if cmdLower == "/continue" || cmdLower == "/monitor" {
-		l.setMode(chatID, true)
-		log.Printf("[lark] chat %s -> continue mode", chatID)
-		l.bus.Outbound <- bus.OutboundMessage{
-			Channel: "lark", ChatID: chatID,
-			Text: "\xF0\x9F\x94\x84 Continue mode ON \xe2\x80\x94 I'll respond to all messages. Say /atmode to switch back.",
-		}
-		w.Write([]byte(`{"ok":true}`))
-		return
-	}
-	if cmdLower == "/atmode" || cmdLower == "/quiet" {
-		l.setMode(chatID, false)
-		log.Printf("[lark] chat %s -> @ mode", chatID)
-		l.bus.Outbound <- bus.OutboundMessage{
-			Channel: "lark", ChatID: chatID,
-			Text: "\xF0\x9F\x94\x95 @ mode ON \xe2\x80\x94 I'll only respond when @mentioned. Say /continue to switch back.",
-		}
-		w.Write([]byte(`{"ok":true}`))
-		return
-	}
-
-	// Filter: in @ mode, only process if @mentioned
-	if !l.isContinueMode(chatID) && !wasMentioned {
+	// Only process if @mentioned
+	if !wasMentioned {
 		w.Write([]byte(`{"ok":true}`))
 		return
 	}
@@ -464,9 +436,11 @@ func (l *LarkChannel) parsePost(post map[string]any, msgID string) (string, []st
 					textParts = append(textParts, t)
 				}
 			case "at":
-				// @mention — include the user's name in text
-				mentioned = true
-				if userName, ok := e["user_name"].(string); ok && userName != "" {
+				// @mention — only set mentioned if it's the bot
+				atUserID, _ := e["user_id"].(string)
+				if atUserID == l.botOpenID {
+					mentioned = true
+				} else if userName, ok := e["user_name"].(string); ok && userName != "" {
 					textParts = append(textParts, "@"+userName)
 				}
 			case "a":
@@ -659,4 +633,57 @@ func autoLearnTeamMembers(workspace string, mentions []mentionInfo) {
 // normalize lowercases and trims a string for fuzzy matching.
 func normalize(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// GetTenantToken exposes the token getter for external tools.
+func (l *LarkChannel) GetTenantToken() string {
+	return l.getTenantToken()
+}
+
+// fetchBotID calls the Lark API to get the bot's own open_id.
+func (l *LarkChannel) fetchBotID() {
+	token := l.getTenantToken()
+	if token == "" {
+		log.Println("[lark] cannot fetch bot ID: no tenant token")
+		return
+	}
+
+	req, _ := http.NewRequest("GET", "https://open.larksuite.com/open-apis/bot/v3/info", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[lark] fetch bot ID error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Code int `json:"code"`
+		Bot  struct {
+			OpenID string `json:"open_id"`
+		} `json:"bot"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	if result.Code != 0 || result.Bot.OpenID == "" {
+		log.Printf("[lark] fetch bot ID failed: code=%d", result.Code)
+		return
+	}
+
+	l.botOpenID = result.Bot.OpenID
+	log.Printf("[lark] bot open_id: %s", l.botOpenID)
+}
+
+// isBotMentioned checks if the bot was @mentioned by looking at the mentions list.
+func (l *LarkChannel) isBotMentioned(mentions []mentionInfo) bool {
+	if l.botOpenID == "" {
+		return false
+	}
+	for _, m := range mentions {
+		if m.OpenID == l.botOpenID {
+			return true
+		}
+	}
+	return false
 }

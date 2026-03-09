@@ -1,0 +1,8 @@
+.git
+.claude
+workspace/repos
+workspace/sessions
+workspace/memory
+config.json
+*.md
+!workspace/**/*.md

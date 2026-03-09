@@ -88,6 +88,7 @@ var runCmd = &cobra.Command{
 			log.Printf("[dashboard] enabled on port %d", cfg.Dashboard.Port)
 		}
 
+		var larkCh *channels.LarkChannel
 		switch channelName {
 		case "cli":
 			mgr.Register(channels.NewCLI(mb))
@@ -96,11 +97,13 @@ var runCmd = &cobra.Command{
 			if larkCfg == nil {
 				log.Fatal("No Lark channel configured")
 			}
-			mgr.Register(channels.NewLark(mb, larkCfg.AppID, larkCfg.AppSecret, larkCfg.AllowFrom, 9000, cfg.Workspace))
+			larkCh = channels.NewLark(mb, larkCfg.AppID, larkCfg.AppSecret, larkCfg.AllowFrom, 9000, cfg.Workspace)
+			mgr.Register(larkCh)
 		case "all":
 			mgr.Register(channels.NewCLI(mb))
 			if larkCfg := findChannel(cfg, "lark"); larkCfg != nil && larkCfg.Enabled {
-				mgr.Register(channels.NewLark(mb, larkCfg.AppID, larkCfg.AppSecret, larkCfg.AllowFrom, 9000, cfg.Workspace))
+				larkCh = channels.NewLark(mb, larkCfg.AppID, larkCfg.AppSecret, larkCfg.AllowFrom, 9000, cfg.Workspace)
+				mgr.Register(larkCh)
 			}
 		}
 
