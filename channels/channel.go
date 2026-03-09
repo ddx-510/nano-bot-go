@@ -9,6 +9,11 @@ type Channel interface {
 	Send(chatID, text string)
 }
 
+// Replier is an optional interface for channels that support replying to specific messages.
+type Replier interface {
+	Reply(chatID, text, replyTo string)
+}
+
 // Manager routes outbound messages to the correct channel.
 type Manager struct {
 	bus      *bus.MessageBus
@@ -31,6 +36,12 @@ func (m *Manager) StartAll() {
 	// Route outbound messages
 	for msg := range m.bus.Outbound {
 		if ch, ok := m.channels[msg.Channel]; ok {
+			if msg.ReplyTo != "" {
+				if r, ok := ch.(Replier); ok {
+					r.Reply(msg.ChatID, msg.Text, msg.ReplyTo)
+					continue
+				}
+			}
 			ch.Send(msg.ChatID, msg.Text)
 		}
 	}

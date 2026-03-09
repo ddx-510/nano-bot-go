@@ -58,6 +58,12 @@ func InitAll(cfg *config.Config) {
 			continue
 		}
 
+		// Clean up directory without .git (failed previous clone)
+		if _, err := os.Stat(path); err == nil {
+			log.Printf("[repos] %s: removing stale directory (no .git)", repo.Name)
+			os.RemoveAll(path)
+		}
+
 		// Clone
 		os.MkdirAll(filepath.Dir(path), 0o755)
 		log.Printf("[repos] cloning %s branch=%s (%s mode)...", repo.Name, branch, cfg.Mode)

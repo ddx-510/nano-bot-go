@@ -14,9 +14,10 @@ import (
 
 // ToolCall represents a function call requested by the LLM.
 type ToolCall struct {
-	ID        string         `json:"id"`
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments"`
+	ID               string         `json:"id"`
+	Name             string         `json:"name"`
+	Arguments        map[string]any `json:"arguments"`
+	ThoughtSignature string         `json:"thought_signature,omitempty"` // Gemini 3+ requirement
 }
 
 // Response from the LLM.
@@ -339,45 +340,67 @@ func (p *Provider) Chat(messages []map[string]any, tools []map[string]any, maxTo
 		return nil, fmt.Errorf("LLM API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	var result struct {
+	// Parse with flexible structure to capture thought_signature from extra_content.google
+	var raw struct {
 		Choices []struct {
-			Message struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
-					ID       string `json:"id"`
-					Type     string `json:"type"`
-					Function struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"function"`
-				} `json:"tool_calls"`
-			} `json:"message"`
+			Message json.RawMessage `json:"message"`
 		} `json:"choices"`
 	}
-
-	if err := json.Unmarshal(respBody, &result); err != nil {
+	if err := json.Unmarshal(respBody, &raw); err != nil {
 		return nil, fmt.Errorf("parse error: %w\nbody: %s", err, string(respBody))
 	}
 
-	if len(result.Choices) == 0 {
+	if len(raw.Choices) == 0 {
 		return &Response{Content: "(empty response from LLM)"}, nil
 	}
 
-	msg := result.Choices[0].Message
-	response := &Response{Content: msg.Content}
+	var msgMap map[string]any
+	json.Unmarshal(raw.Choices[0].Message, &msgMap)
 
-	for _, tc := range msg.ToolCalls {
-		var args map[string]any
-		repaired := repairJSON(tc.Function.Arguments)
-		if err := json.Unmarshal([]byte(repaired), &args); err != nil {
-			log.Printf("[provider] JSON repair failed for tool %s: %v (raw: %s)", tc.Function.Name, err, tc.Function.Arguments)
-			args = make(map[string]any)
+	content, _ := msgMap["content"].(string)
+	response := &Response{Content: content}
+
+	if toolCalls, ok := msgMap["tool_calls"].([]any); ok {
+		for _, rawTC := range toolCalls {
+			tc, _ := rawTC.(map[string]any)
+			if tc == nil {
+				continue
+			}
+			id, _ := tc["id"].(string)
+
+			// Extract thought_signature from extra_content.google (Gemini OpenAI-compat format)
+			var sig string
+			if ec, ok := tc["extra_content"].(map[string]any); ok {
+				if google, ok := ec["google"].(map[string]any); ok {
+					sig, _ = google["thought_signature"].(string)
+				}
+			}
+			// Fallback: check top-level (in case format varies)
+			if sig == "" {
+				sig, _ = tc["thought_signature"].(string)
+			}
+
+			fn, _ := tc["function"].(map[string]any)
+			if fn == nil {
+				continue
+			}
+			name, _ := fn["name"].(string)
+			argsStr, _ := fn["arguments"].(string)
+
+			var args map[string]any
+			repaired := repairJSON(argsStr)
+			if err := json.Unmarshal([]byte(repaired), &args); err != nil {
+				log.Printf("[provider] JSON repair failed for tool %s: %v (raw: %s)", name, err, argsStr)
+				args = make(map[string]any)
+			}
+
+			response.ToolCalls = append(response.ToolCalls, ToolCall{
+				ID:               id,
+				Name:             name,
+				Arguments:        args,
+				ThoughtSignature: sig,
+			})
 		}
-		response.ToolCalls = append(response.ToolCalls, ToolCall{
-			ID:        tc.ID,
-			Name:      tc.Function.Name,
-			Arguments: args,
-		})
 	}
 
 	return response, nil

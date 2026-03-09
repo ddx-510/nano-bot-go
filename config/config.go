@@ -39,11 +39,13 @@ type CronJobConfig struct {
 }
 
 type ChannelConfig struct {
-	Type      string   `json:"type"`
-	Enabled   bool     `json:"enabled"`
-	AppID     string   `json:"app_id,omitempty"`
-	AppSecret string   `json:"app_secret,omitempty"`
-	AllowFrom []string `json:"allow_from,omitempty"`
+	Type              string   `json:"type"`
+	Enabled           bool     `json:"enabled"`
+	AppID             string   `json:"app_id,omitempty"`
+	AppSecret         string   `json:"app_secret,omitempty"`
+	EncryptKey        string   `json:"encrypt_key,omitempty"`
+	VerificationToken string   `json:"verification_token,omitempty"`
+	AllowFrom         []string `json:"allow_from,omitempty"`
 }
 
 type HeartbeatConfig struct {
@@ -52,8 +54,9 @@ type HeartbeatConfig struct {
 }
 
 type DashboardConfig struct {
-	Enabled bool `json:"enabled"`
-	Port    int  `json:"port,omitempty"` // default 8080
+	Enabled  bool   `json:"enabled"`
+	Port     int    `json:"port,omitempty"`      // default 8080
+	Password string `json:"password,omitempty"`  // basic auth password (user: admin)
 }
 
 type Config struct {

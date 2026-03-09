@@ -2,6 +2,10 @@ package channels
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,12 +21,14 @@ import (
 )
 
 type LarkChannel struct {
-	bus       *bus.MessageBus
-	appID     string
-	appSecret string
-	port      int
-	workspace string
-	allowFrom map[string]bool
+	bus               *bus.MessageBus
+	appID             string
+	appSecret         string
+	encryptKey        string // Lark event encrypt key (AES decryption)
+	verificationToken string // Lark event verification token
+	port              int
+	workspace         string
+	allowFrom         map[string]bool
 
 	botOpenID string // bot's own open_id, fetched at startup
 
@@ -31,7 +37,7 @@ type LarkChannel struct {
 	tokenExp time.Time
 }
 
-func NewLark(mb *bus.MessageBus, appID, appSecret string, allowFrom []string, port int, workspace string) *LarkChannel {
+func NewLark(mb *bus.MessageBus, appID, appSecret, encryptKey, verificationToken string, allowFrom []string, port int, workspace string) *LarkChannel {
 	af := make(map[string]bool)
 	for _, id := range allowFrom {
 		af[id] = true
@@ -40,12 +46,14 @@ func NewLark(mb *bus.MessageBus, appID, appSecret string, allowFrom []string, po
 		port = 9000
 	}
 	return &LarkChannel{
-		bus:       mb,
-		appID:     appID,
-		appSecret: appSecret,
-		port:      port,
-		workspace: workspace,
-		allowFrom: af,
+		bus:               mb,
+		appID:             appID,
+		appSecret:         appSecret,
+		encryptKey:        encryptKey,
+		verificationToken: verificationToken,
+		port:              port,
+		workspace:         workspace,
+		allowFrom:         af,
 	}
 }
 
@@ -73,10 +81,44 @@ func (l *LarkChannel) handleEvent(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	defer r.Body.Close()
 
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
 		http.Error(w, "invalid json", 400)
 		return
+	}
+
+	// Decrypt if encrypted
+	var payload map[string]any
+	if encrypted, ok := raw["encrypt"].(string); ok && l.encryptKey != "" {
+		decrypted, err := l.decryptEvent(encrypted)
+		if err != nil {
+			log.Printf("[lark] decrypt failed: %v", err)
+			http.Error(w, "decrypt failed", 400)
+			return
+		}
+		if err := json.Unmarshal(decrypted, &payload); err != nil {
+			log.Printf("[lark] decrypt json parse failed: %v", err)
+			http.Error(w, "invalid decrypted json", 400)
+			return
+		}
+	} else {
+		payload = raw
+	}
+
+	// Verify token if configured
+	if l.verificationToken != "" {
+		token, _ := payload["token"].(string)
+		if token == "" {
+			// v2 events: token is in header.token
+			if header, ok := payload["header"].(map[string]any); ok {
+				token, _ = header["token"].(string)
+			}
+		}
+		if token != l.verificationToken {
+			log.Printf("[lark] verification token mismatch: got=%q", token)
+			http.Error(w, "invalid token", 403)
+			return
+		}
 	}
 
 	// URL verification challenge
@@ -166,7 +208,7 @@ func (l *LarkChannel) handleEvent(w http.ResponseWriter, r *http.Request) {
 		// Rich text — extract text and any inline images
 		var post map[string]any
 		json.Unmarshal([]byte(contentStr), &post)
-		text, images, wasMentioned = l.parsePost(post, msgID)
+		text, images, wasMentioned = l.parsePost(post, msgID, mentionMap)
 
 	default:
 		w.Write([]byte(`{"ok":true}`))
@@ -204,6 +246,7 @@ func (l *LarkChannel) handleEvent(w http.ResponseWriter, r *http.Request) {
 		ChatID:    chatID,
 		User:      userID,
 		Text:      text,
+		MessageID: msgID,
 		Images:    images,
 		Timestamp: time.Now(),
 	}
@@ -263,6 +306,43 @@ func (l *LarkChannel) Send(chatID, text string) {
 		if json.Unmarshal(respBody, &result) == nil && result.Code != 0 {
 			log.Printf("[lark] send error: code=%d msg=%s (type=%s)", result.Code, result.Msg, msgType)
 		}
+	}
+}
+
+// Reply sends a message as a reply to a specific message ID.
+func (l *LarkChannel) Reply(chatID, text, replyTo string) {
+	token := l.getTenantToken()
+	if token == "" {
+		log.Println("[lark] no tenant token")
+		return
+	}
+
+	contentJSON, _ := json.Marshal(map[string]string{"text": text})
+	payload, _ := json.Marshal(map[string]any{
+		"msg_type": "text",
+		"content":  string(contentJSON),
+	})
+
+	url := fmt.Sprintf("https://open.larksuite.com/open-apis/im/v1/messages/%s/reply", replyTo)
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[lark] reply error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if json.Unmarshal(respBody, &result) == nil && result.Code != 0 {
+		log.Printf("[lark] reply error: code=%d msg=%s", result.Code, result.Msg)
 	}
 }
 
@@ -401,10 +481,18 @@ func (l *LarkChannel) downloadImage(msgID, imageKey string) (string, error) {
 
 // parsePost extracts text, @mentions, and images from a Lark rich-text (post) message.
 // Returns: text content, image paths, whether bot was @mentioned.
-func (l *LarkChannel) parsePost(post map[string]any, msgID string) (string, []string, bool) {
+func (l *LarkChannel) parsePost(post map[string]any, msgID string, mentions []mentionInfo) (string, []string, bool) {
 	var textParts []string
 	var images []string
 	mentioned := false
+
+	// Build a lookup from placeholder key (@_user_1) to open_id
+	keyToOpenID := make(map[string]string)
+	for _, m := range mentions {
+		if m.Key != "" {
+			keyToOpenID[m.Key] = m.OpenID
+		}
+	}
 
 	// Post content can be at top level {"title","content"} or under a language key {"zh_cn":{"title","content"}}
 	body := post
@@ -436,9 +524,10 @@ func (l *LarkChannel) parsePost(post map[string]any, msgID string) (string, []st
 					textParts = append(textParts, t)
 				}
 			case "at":
-				// @mention — only set mentioned if it's the bot
-				atUserID, _ := e["user_id"].(string)
-				if atUserID == l.botOpenID {
+				// @mention — user_id here is a placeholder like "@_user_1", resolve via mentionMap
+				placeholder, _ := e["user_id"].(string)
+				realID := keyToOpenID[placeholder]
+				if realID == l.botOpenID {
 					mentioned = true
 				} else if userName, ok := e["user_name"].(string); ok && userName != "" {
 					textParts = append(textParts, "@"+userName)
@@ -638,6 +727,45 @@ func normalize(s string) string {
 // GetTenantToken exposes the token getter for external tools.
 func (l *LarkChannel) GetTenantToken() string {
 	return l.getTenantToken()
+}
+
+// decryptEvent decrypts a Lark encrypted event using AES-256-CBC.
+// Format: base64(IV + AES-CBC(SHA256(key), plaintext))
+func (l *LarkChannel) decryptEvent(encrypted string) ([]byte, error) {
+	ciphertext, err := base64.StdEncoding.DecodeString(encrypted)
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode: %w", err)
+	}
+
+	key := sha256.Sum256([]byte(l.encryptKey))
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, fmt.Errorf("aes cipher: %w", err)
+	}
+
+	if len(ciphertext) < aes.BlockSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	iv := ciphertext[:aes.BlockSize]
+	ciphertext = ciphertext[aes.BlockSize:]
+
+	if len(ciphertext)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("ciphertext not block-aligned")
+	}
+
+	mode := cipher.NewCBCDecrypter(block, iv)
+	mode.CryptBlocks(ciphertext, ciphertext)
+
+	// Remove PKCS7 padding
+	if len(ciphertext) == 0 {
+		return nil, fmt.Errorf("empty plaintext")
+	}
+	padLen := int(ciphertext[len(ciphertext)-1])
+	if padLen > aes.BlockSize || padLen == 0 {
+		return nil, fmt.Errorf("invalid padding")
+	}
+	return ciphertext[:len(ciphertext)-padLen], nil
 }
 
 // fetchBotID calls the Lark API to get the bot's own open_id.

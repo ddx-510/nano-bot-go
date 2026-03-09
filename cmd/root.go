@@ -82,7 +82,7 @@ var runCmd = &cobra.Command{
 
 		// Register dashboard as both Channel and Hook
 		if cfg.Dashboard.Enabled {
-			dash := dashboard.New(mb, cfg.Dashboard.Port)
+			dash := dashboard.New(mb, cfg.Dashboard.Port, cfg.Dashboard.Password)
 			mgr.Register(dash)
 			emitter.Register(dash)
 			log.Printf("[dashboard] enabled on port %d", cfg.Dashboard.Port)
@@ -97,12 +97,12 @@ var runCmd = &cobra.Command{
 			if larkCfg == nil {
 				log.Fatal("No Lark channel configured")
 			}
-			larkCh = channels.NewLark(mb, larkCfg.AppID, larkCfg.AppSecret, larkCfg.AllowFrom, 9000, cfg.Workspace)
+			larkCh = channels.NewLark(mb, larkCfg.AppID, larkCfg.AppSecret, larkCfg.EncryptKey, larkCfg.VerificationToken, larkCfg.AllowFrom, 9000, cfg.Workspace)
 			mgr.Register(larkCh)
 		case "all":
 			mgr.Register(channels.NewCLI(mb))
 			if larkCfg := findChannel(cfg, "lark"); larkCfg != nil && larkCfg.Enabled {
-				larkCh = channels.NewLark(mb, larkCfg.AppID, larkCfg.AppSecret, larkCfg.AllowFrom, 9000, cfg.Workspace)
+				larkCh = channels.NewLark(mb, larkCfg.AppID, larkCfg.AppSecret, larkCfg.EncryptKey, larkCfg.VerificationToken, larkCfg.AllowFrom, 9000, cfg.Workspace)
 				mgr.Register(larkCh)
 			}
 		}

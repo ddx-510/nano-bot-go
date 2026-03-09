@@ -164,11 +164,12 @@ func (l *Loop) process(msg bus.InboundMessage) {
 		return
 	}
 
-	// Immediate ack so the user knows we're processing
+	// Immediate ack — reply to the original message
 	l.sendOutbound(bus.OutboundMessage{
 		Channel: msg.Channel,
 		ChatID:  msg.ChatID,
 		Text:    "\U0001f504 收到，处理中...",
+		ReplyTo: msg.MessageID,
 	})
 
 	// Check if memory consolidation is needed
@@ -402,14 +403,22 @@ func (l *Loop) reactLoop(ctx context.Context, messages []map[string]any, channel
 		var tcList []map[string]any
 		for _, tc := range resp.ToolCalls {
 			argsJSON, _ := json.Marshal(tc.Arguments)
-			tcList = append(tcList, map[string]any{
+			tcEntry := map[string]any{
 				"id":   tc.ID,
 				"type": "function",
 				"function": map[string]any{
 					"name":      tc.Name,
 					"arguments": string(argsJSON),
 				},
-			})
+			}
+			if tc.ThoughtSignature != "" {
+				tcEntry["extra_content"] = map[string]any{
+					"google": map[string]any{
+						"thought_signature": tc.ThoughtSignature,
+					},
+				}
+			}
+			tcList = append(tcList, tcEntry)
 		}
 		assistantMsg["tool_calls"] = tcList
 		messages = append(messages, assistantMsg)

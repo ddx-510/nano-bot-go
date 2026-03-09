@@ -154,14 +154,22 @@ func (m *SubagentManager) run(ctx context.Context, id, task, label, channel, cha
 		var tcList []map[string]any
 		for _, tc := range resp.ToolCalls {
 			argsJSON, _ := json.Marshal(tc.Arguments)
-			tcList = append(tcList, map[string]any{
+			tcEntry := map[string]any{
 				"id":   tc.ID,
 				"type": "function",
 				"function": map[string]any{
 					"name":      tc.Name,
 					"arguments": string(argsJSON),
 				},
-			})
+			}
+			if tc.ThoughtSignature != "" {
+				tcEntry["extra_content"] = map[string]any{
+					"google": map[string]any{
+						"thought_signature": tc.ThoughtSignature,
+					},
+				}
+			}
+			tcList = append(tcList, tcEntry)
 		}
 		assistantMsg["tool_calls"] = tcList
 		messages = append(messages, assistantMsg)

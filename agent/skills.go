@@ -15,12 +15,39 @@ type Skill struct {
 	Body        string
 }
 
-// LoadSkills reads skills from workspace/skills/.
+// LoadSkills reads skills from workspace/skills/ and any skills/ directories
+// found inside cloned repos (repos/*/skills/).
 // Supports two formats:
 //   - Flat files: skills/{name}.md
 //   - Directories: skills/{name}/SKILL.md
 func LoadSkills(workspace string) []Skill {
-	dir := filepath.Join(workspace, "skills")
+	var skills []Skill
+
+	// Primary: workspace/skills/
+	skills = append(skills, loadSkillsFromDir(filepath.Join(workspace, "skills"), "skills")...)
+
+	// Secondary: repos/*/skills/ — auto-discovered from cloned repos
+	reposDir := filepath.Join(workspace, "repos")
+	repoEntries, err := os.ReadDir(reposDir)
+	if err == nil {
+		for _, repo := range repoEntries {
+			if !repo.IsDir() {
+				continue
+			}
+			repoSkillsDir := filepath.Join(reposDir, repo.Name(), ".claude", "skills")
+			if _, err := os.Stat(repoSkillsDir); err != nil {
+				continue
+			}
+			relPrefix := filepath.Join("repos", repo.Name(), "skills")
+			skills = append(skills, loadSkillsFromDir(repoSkillsDir, relPrefix)...)
+		}
+	}
+
+	return skills
+}
+
+// loadSkillsFromDir scans a single directory for skills.
+func loadSkillsFromDir(dir, relPrefix string) []Skill {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
@@ -31,17 +58,17 @@ func LoadSkills(workspace string) []Skill {
 		var path, relPath string
 
 		if e.IsDir() {
-			// Directory format: skills/{name}/SKILL.md
+			// Directory format: {dir}/{name}/SKILL.md
 			skillFile := filepath.Join(dir, e.Name(), "SKILL.md")
 			if _, err := os.Stat(skillFile); err != nil {
 				continue
 			}
 			path = skillFile
-			relPath = filepath.Join("skills", e.Name(), "SKILL.md")
+			relPath = filepath.Join(relPrefix, e.Name(), "SKILL.md")
 		} else if strings.HasSuffix(e.Name(), ".md") {
-			// Flat file format: skills/{name}.md
+			// Flat file format: {dir}/{name}.md
 			path = filepath.Join(dir, e.Name())
-			relPath = filepath.Join("skills", e.Name())
+			relPath = filepath.Join(relPrefix, e.Name())
 		} else {
 			continue
 		}

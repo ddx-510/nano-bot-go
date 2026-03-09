@@ -30,6 +30,7 @@ type Dashboard struct {
 	bus       *bus.MessageBus
 	hub       *Hub
 	port      int
+	password  string
 	startTime time.Time
 
 	mu     sync.Mutex
@@ -37,7 +38,7 @@ type Dashboard struct {
 }
 
 // New creates a new Dashboard.
-func New(mb *bus.MessageBus, port int) *Dashboard {
+func New(mb *bus.MessageBus, port int, password string) *Dashboard {
 	if port == 0 {
 		port = 8080
 	}
@@ -45,6 +46,7 @@ func New(mb *bus.MessageBus, port int) *Dashboard {
 		bus:       mb,
 		hub:       newHub(),
 		port:      port,
+		password:  password,
 		startTime: time.Now(),
 		recent:    make([]hooks.Event, 0, maxRecentEvents),
 	}
@@ -57,14 +59,30 @@ func (d *Dashboard) Name() string { return "dashboard" }
 // Start launches the HTTP server. Called as a goroutine by the channel manager.
 func (d *Dashboard) Start() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", d.handleIndex)
-	mux.HandleFunc("/ws", d.handleWS)
-	mux.HandleFunc("/api/state", d.handleState)
+	mux.HandleFunc("/", d.requireAuth(d.handleIndex))
+	mux.HandleFunc("/ws", d.requireAuth(d.handleWS))
+	mux.HandleFunc("/api/state", d.requireAuth(d.handleState))
 
-	addr := fmt.Sprintf(":%d", d.port)
-	log.Printf("[dashboard] listening on http://localhost%s", addr)
+	addr := fmt.Sprintf("0.0.0.0:%d", d.port)
+	log.Printf("[dashboard] listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Printf("[dashboard] server error: %v", err)
+	}
+}
+
+// requireAuth wraps a handler with HTTP Basic Auth if a password is configured.
+func (d *Dashboard) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	if d.password == "" {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, pass, ok := r.BasicAuth()
+		if !ok || pass != d.password {
+			w.Header().Set("WWW-Authenticate", `Basic realm="CCMonet Dashboard"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
 	}
 }
 
